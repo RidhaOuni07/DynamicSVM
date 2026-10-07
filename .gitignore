@@ -1,3 +1,9 @@
 *.md
 *.pdf
-*.txt
+__pycache__/
+*.py[cod]
+*.egg-info/
+.idea/
+.venv/
+venv/
+*.egg-info/
