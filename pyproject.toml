@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dynamicsvm"
+version = "0.1.0"
+description = "A modular Python library for Static and Dynamic (Incremental, Decremental, Concept Drift) Support Vector Machines"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [
+    { name = "PhD Researcher" }
+]
+dependencies = [
+    "numpy>=1.20.0",
+    "scipy>=1.7.0",
+    "matplotlib>=3.3.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0"
+]
