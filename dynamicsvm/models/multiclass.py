@@ -6,7 +6,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 import numpy as np
 
 from dynamicsvm.base import BaseClassifier
-from dynamicsvm.kernels import Kernel
+from dynamicsvm.kernels import Kernel, get_kernel, resolve_gamma
 from dynamicsvm.models.svc import SVC
 from dynamicsvm.utils.validation import check_X_y, check_array, check_is_fitted
 
@@ -25,6 +25,19 @@ class MultiClassSVC(BaseClassifier):
         Multi-class decomposition strategy.
     **kwargs :
         Additional arguments passed to binary SVC estimators.
+
+    Notes
+    -----
+    A string ``gamma`` is resolved once on the full training matrix and shared
+    by every binary sub-problem (as in libsvm).
+
+    OvR predicts ``argmax_k f_k(x)``. The binary machines are trained
+    independently, so their margins are not calibrated against each other;
+    the comparison is the standard heuristic, not a probabilistic rule.
+
+    OvO predicts by majority vote over the K(K-1)/2 pairwise machines. Ties
+    go to the class with the lowest index in ``classes_`` (``np.argmax``
+    returns the first maximum), as in libsvm.
     """
 
     def __init__(
@@ -53,13 +66,27 @@ class MultiClassSVC(BaseClassifier):
         if n_classes < 2:
             raise ValueError("Training data must contain at least 2 distinct classes.")
 
+        self.n_features_in_ = X_arr.shape[1]
+
+        # Resolve a string gamma ONCE on the full training matrix and give the
+        # same float to every binary sub-problem (libsvm does the same for OvO);
+        # otherwise each OvO pair would get its own data-dependent kernel.
+        sub_kwargs = dict(self.kwargs)
+        kernel = self.kernel
+        if isinstance(kernel, str):
+            gamma = sub_kwargs.get("gamma", "scale")
+            if isinstance(gamma, str):
+                sub_kwargs["gamma"] = resolve_gamma(gamma, X=X_arr)
+        elif isinstance(kernel, Kernel):
+            kernel = get_kernel(kernel, X=X_arr, n_features=X_arr.shape[1])
+
         self.estimators_ = []
 
         if self.strategy == "ovr":
             # Train one binary SVC for each class vs all other classes
             for cls in self.classes_:
                 y_binary = np.where(y_arr == cls, 1, 0)
-                estimator = SVC(C=self.C, kernel=self.kernel, **self.kwargs)
+                estimator = SVC(C=self.C, kernel=kernel, **sub_kwargs)
                 estimator.fit(X_arr, y_binary)
                 self.estimators_.append(estimator)
 
@@ -74,7 +101,7 @@ class MultiClassSVC(BaseClassifier):
                     X_pair = X_arr[mask]
                     y_pair = y_arr[mask]
 
-                    estimator = SVC(C=self.C, kernel=self.kernel, **self.kwargs)
+                    estimator = SVC(C=self.C, kernel=kernel, **sub_kwargs)
                     estimator.fit(X_pair, y_pair)
                     self.estimators_.append(estimator)
                     self.pairs_.append((i, j))
@@ -86,7 +113,7 @@ class MultiClassSVC(BaseClassifier):
         Evaluate decision functions across all sub-estimators.
         """
         check_is_fitted(self, attributes=["classes_"])
-        X_arr = check_array(X)
+        X_arr = check_array(X, n_features=getattr(self, "n_features_in_", None))
 
         if self.strategy == "ovr":
             scores = np.column_stack([est.decision_function(X_arr) for est in self.estimators_])
@@ -100,7 +127,7 @@ class MultiClassSVC(BaseClassifier):
         Predict class labels for samples in X.
         """
         check_is_fitted(self, attributes=["classes_"])
-        X_arr = check_array(X)
+        X_arr = check_array(X, n_features=getattr(self, "n_features_in_", None))
         n_samples = X_arr.shape[0]
 
         if self.strategy == "ovr":

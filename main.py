@@ -25,6 +25,7 @@ from dynamicsvm.benchmarks.datasets import make_sea_stream
 from dynamicsvm.benchmarks.evaluator import PrequentialEvaluator
 from dynamicsvm.benchmarks.runner import benchmark_streaming_suite
 from dynamicsvm.utils.metrics import accuracy_score, confusion_matrix
+from dynamicsvm.utils.kkt import dual_objective, kkt_report
 from dynamicsvm.visualization.plots import plot_decision_boundary
 
 
@@ -186,8 +187,8 @@ def main():
         eta=0.7,
         max_buffer_size=100,
         min_buffer_size=15,
-        drift_threshold=0.5,
-        warning_threshold=0.2,
+        drift_threshold=3.0,  # D_t = -log10 p: drift when p < 0.001
+        warning_threshold=2.0,  # warning when p < 0.01
         lambda_base=0.92,
         lambda_min=0.45,
         retire_ratio_on_drift=0.35,
@@ -210,7 +211,7 @@ def main():
     state = cov_svm.get_model_state()
     print(f"Drift Events Detected: {len(cov_svm.drift_events_)}")
     for ev in cov_svm.drift_events_:
-        print(f"  -> Drift at step {ev['time']}: D_t = {ev['D_t']:.4f}, adaptive lambda = {ev['lambda_t']:.4f}, retired {ev['retired_samples']} samples")
+        print(f"  -> Drift at step {ev['time']}: D_t = -log10 p = {ev['D_t']:.4f}, adaptive lambda = {ev['lambda_t']:.4f}, retired {ev['retired_samples']} samples")
 
     post_drift_acc = accuracy_score(y_drift_stream, cov_svm.predict(X_drift_stream))
     print(f"Adapted Model Accuracy on New Regime: {post_drift_acc * 100:.2f}%")
@@ -222,7 +223,8 @@ def main():
     # -------------------------------------------------------------
     print("\n--- [Experiment 6] Low-Variance Direction One-Class SVM (COSVM / ICOSVM) ---")
     print("Paper: Kefi-Fatteh et al. (Pattern Recognition 2019)")
-    print("Optimization: min 0.5 * alpha^T (eta * K + (1-eta) * K H K^T) alpha")
+    print("Optimization: min 0.5 * alpha^T G alpha, G = K A^-1 K, A = eta*K + ((1-eta)/N) * K H K")
+    print("ICOSVM updates: warm-started exact re-solve of the current COSVM dual")
 
     rng = np.random.RandomState(42)
     # Generate anisotropic target distribution (high variance along x, low variance along y)
@@ -265,7 +267,7 @@ def main():
     # -------------------------------------------------------------
     print("\n--- [Experiment 7] Adiabatic Path Following Incremental / Decremental SVM ---")
     print("Paper: Cauwenberghs & Poggio (NeurIPS 2000 / 2001), Laskov et al. (JMLR 2006)")
-    print("Mechanism: Exact continuous tracking of sensitivity matrix R and KKT sets (S, E, O)")
+    print("Mechanism: KKT path following over the sets (S, E, O); R recomputed at every event")
 
     X_init_ad = np.array([
         [2.0, 2.0], [2.5, 2.3], [3.0, 2.8],
@@ -290,6 +292,22 @@ def main():
     print(f"After unlearning oldest observation (forget_one): {adiabatic_svm.get_model_state()}")
     ad_preds = adiabatic_svm.predict(stream_ad_X)
     print(f"Predictions on test stream: {ad_preds} (Ground Truth: {stream_ad_y})")
+
+    # Verify the decremental step: equality constraint, KKT gap and agreement with a retrain
+    y_buf_ad = np.asarray(adiabatic_svm.y_buffer_, dtype=float)
+    X_buf_ad = np.asarray(adiabatic_svm.X_buffer_)
+    ad_report = kkt_report(adiabatic_svm.alpha_, adiabatic_svm.K_full_, y_buf_ad, adiabatic_svm.C)
+    print(f"|sum alpha_i y_i| after forget_one(0): {ad_report['sum_alpha_y']:.2e} | "
+          f"KKT gap: {ad_report['kkt_gap']:.2e} | SMO fallbacks: {adiabatic_svm.n_smo_fallbacks_}")
+    retrain_ad = SVC(C=1.0, kernel="rbf", gamma=0.5, solver="smo", tol=1e-6, max_iter=10000, random_state=42)
+    retrain_ad.fit(X_buf_ad, y_buf_ad)
+    K_ad = adiabatic_svm.K_full_
+    alpha_rt = np.zeros(len(y_buf_ad))
+    alpha_rt[retrain_ad.support_] = retrain_ad.alpha_
+    X_eval_ad = np.vstack([X_buf_ad, stream_ad_X])
+    f_diff_ad = np.max(np.abs(adiabatic_svm.decision_function(X_eval_ad) - retrain_ad.decision_function(X_eval_ad)))
+    print(f"Dual objective: decremental {ad_report['dual_objective']:.6f} vs SVC retrain "
+          f"{dual_objective(alpha_rt, K_ad, y_buf_ad):.6f} | max |f_decremental - f_retrain| = {f_diff_ad:.2e}")
 
     # -------------------------------------------------------------
     # 8. LASVM (Online & Active Learning with SV Filtering)

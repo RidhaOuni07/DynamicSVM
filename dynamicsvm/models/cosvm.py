@@ -20,40 +20,34 @@ direction motivation developed further in:
 Mathematical formulation
 ------------------------
 
-Let K be the kernel Gram matrix:
+With the kernel feature map phi, Phi = [phi(x_1), ..., phi(x_N)],
+K = Phi^T Phi, H = I - (1/N) 11^T and the feature-space covariance
 
-    K_ij = k(x_i, x_j)
+    Sigma = (1/N) Phi H Phi^T,
 
-and let
+the COSVM primal is
 
-    H = I - (1/N) 11^T
+    minimize    1/2 w^T (eta I + (1 - eta) Sigma) w - rho + C sum_i xi_i
+    subject to  w^T phi(x_i) >= rho - xi_i,   xi_i >= 0,
 
-be the centering matrix.
+with 0 < eta <= 1 and C = 1 / (nu N). Penalising w^T Sigma w pushes w
+towards the low-variance directions of the target class.
 
-The covariance-guided kernel matrix is
+Its dual is
 
-    K_tilde = eta K + (1 - eta) K H K^T
+    minimize    1/2 alpha^T G alpha
+    subject to  0 <= alpha_i <= C,   sum(alpha_i) = 1,
 
-with
+    G = K A^{-1} K,   A = eta K + ((1 - eta)/N) K H K,
 
-    0 <= eta <= 1.
+and the decision function is
 
-The COSVM dual is solved as:
+    f(x) = k(x, X)^T A^{-1} K alpha - rho = k(x, X)^T coef - rho.
 
-    minimize
-        1/2 alpha^T K_tilde alpha
-
-    subject to
-        0 <= alpha_i <= C
-        sum(alpha_i) = 1
-
-where
-
-    C = 1 / (nu N).
-
-The decision function is
-
-    f(x) = sum_i alpha_i K_tilde(x, x_i) - rho.
+On training rows K coef = G alpha, so the KKT conditions and the decision
+function use the same scores. eta = 1 is exactly the standard one-class
+SVM (G = K). The derivation and the numerical treatment (Cholesky of
+A + eps I) are in ``dynamicsvm.models._cosvm_core``.
 
 Positive values correspond to normal samples and negative values
 correspond to anomalies.
@@ -62,10 +56,17 @@ correspond to anomalies.
 from typing import Callable, Optional, Union
 
 import numpy as np
-from scipy.optimize import minimize
+from scipy.linalg import cho_solve
 
 from dynamicsvm.base import BaseSVM
 from dynamicsvm.kernels import Kernel, get_kernel
+from dynamicsvm.models._cosvm_core import (
+    COSVMGeometry,
+    compute_rho,
+    solve_oneclass_dual,
+    stabilize_psd,
+    validate_eta,
+)
 from dynamicsvm.utils.validation import check_array, check_is_fitted
 
 
@@ -84,17 +85,18 @@ class COSVM(BaseSVM):
             0 < nu <= 1
 
     eta : float, default=0.5
-        Trade-off between the standard kernel geometry and the
-        covariance-guided component.
+        Weight of the identity in the primal metric
+        M = eta I + (1 - eta) Sigma.
 
             eta = 1:
-                Standard One-Class SVM kernel.
-
-            eta = 0:
-                Pure covariance-guided component.
+                Standard One-Class SVM.
 
             0 < eta < 1:
-                Combination of both.
+                Covariance-guided COSVM; smaller eta penalises the
+                high-variance directions of the target class more.
+
+        eta = 0 is rejected: the out-of-sample score is then
+        ill-defined (A is singular).
 
     kernel : {'rbf', 'linear', 'poly', 'sigmoid'} or Kernel or Callable
         Kernel function.
@@ -109,22 +111,29 @@ class COSVM(BaseSVM):
         Independent term in polynomial and sigmoid kernels.
 
     tol : float, default=1e-5
-        Optimization tolerance.
+        Optimization tolerance. SLSQP runs at ftol = min(tol, 1e-10).
 
     max_iter : int, default=1000
         Maximum number of SLSQP iterations.
 
     psd_tol : float, default=1e-10
-        Numerical tolerance used when checking the modified Gram
-        matrix for positive semidefiniteness.
+        Relative tolerance used when checking the dual Gram matrix G for
+        positive semidefiniteness: eigenvalues down to
+        -psd_tol * max(1, max |eig(G)|) are treated as rounding.
 
     sv_tol : float, default=1e-7
         Tolerance for identifying support vectors.
+
+    reg : float, default=1e-10
+        Relative ridge of A: A + eps I with eps = reg * trace(A) / N.
 
     Attributes
     ----------
     alpha_ : ndarray
         Complete vector of dual coefficients.
+
+    coef_ : ndarray
+        Score coefficients A^{-1} K alpha; score(x) = k(x, X)^T coef_.
 
     support_ : ndarray
         Indices of support vectors.
@@ -148,7 +157,10 @@ class COSVM(BaseSVM):
         Original kernel Gram matrix.
 
     K_tilde_ : ndarray
-        Covariance-guided Gram matrix.
+        Dual Gram matrix G = K A^{-1} K.
+
+    geometry_ : COSVMGeometry
+        Factorised geometry of the training set.
 
     C_ : float
         Upper bound on each alpha_i.
@@ -166,6 +178,7 @@ class COSVM(BaseSVM):
         max_iter: int = 1000,
         psd_tol: float = 1e-10,
         sv_tol: float = 1e-7,
+        reg: float = 1e-10,
     ):
         super().__init__()
 
@@ -174,10 +187,7 @@ class COSVM(BaseSVM):
                 f"nu must be in (0, 1], got {nu}"
             )
 
-        if not (0.0 <= eta <= 1.0):
-            raise ValueError(
-                f"eta must be in [0, 1], got {eta}"
-            )
+        validate_eta(eta)
 
         if tol <= 0:
             raise ValueError(
@@ -199,6 +209,11 @@ class COSVM(BaseSVM):
                 f"sv_tol must be > 0, got {sv_tol}"
             )
 
+        if reg <= 0:
+            raise ValueError(
+                f"reg must be > 0, got {reg}"
+            )
+
         self.nu = float(nu)
         self.eta = float(eta)
 
@@ -212,6 +227,7 @@ class COSVM(BaseSVM):
 
         self.psd_tol = float(psd_tol)
         self.sv_tol = float(sv_tol)
+        self.reg = float(reg)
 
         # Fitted attributes
         self.kernel_: Optional[Kernel] = None
@@ -220,8 +236,10 @@ class COSVM(BaseSVM):
 
         self.K_train_: Optional[np.ndarray] = None
         self.K_tilde_: Optional[np.ndarray] = None
+        self.geometry_: Optional[COSVMGeometry] = None
 
         self.alpha_: Optional[np.ndarray] = None
+        self.coef_: Optional[np.ndarray] = None
 
         self.support_: Optional[np.ndarray] = None
         self.support_vectors_: Optional[np.ndarray] = None
@@ -263,54 +281,17 @@ class COSVM(BaseSVM):
         K: np.ndarray,
     ) -> np.ndarray:
         """
-        Compute the COSVM modified Gram matrix:
+        Compute the COSVM dual Gram matrix
 
-            K_tilde = eta K + (1 - eta) K H K^T
+            G = K A^{-1} K,   A = eta K + ((1 - eta)/N) K H K,
 
-        where
-
-            H = I - (1/N) 11^T.
-
-        Since K is symmetric for a standard kernel Gram matrix,
-        K^T = K, but K^T is kept explicitly for mathematical clarity.
+        (G = K when eta == 1). See ``_cosvm_core.COSVMGeometry``.
         """
-        K = np.asarray(K, dtype=float)
-
-        if K.ndim != 2:
-            raise ValueError(
-                "K must be a two-dimensional matrix."
-            )
-
-        n_samples, n_features = K.shape
-
-        if n_samples != n_features:
-            raise ValueError(
-                "Training Gram matrix must be square."
-            )
-
-        if n_samples == 1:
-            return K.copy()
-
-        # H = I - 11^T / N
-        H = self._centering_matrix(n_samples)
-
-        # Covariance-guided component:
-        #
-        #     K H K^T
-        #
-        covariance_component = K @ H @ K.T
-
-        K_tilde = (
-            self.eta * K
-            + (1.0 - self.eta) * covariance_component
-        )
-
-        # Numerical symmetrization.
-        K_tilde = 0.5 * (
-            K_tilde + K_tilde.T
-        )
-
-        return K_tilde
+        return COSVMGeometry(
+            K,
+            self.eta,
+            reg=self.reg,
+        ).G
 
     def _stabilize_psd_matrix(
         self,
@@ -319,29 +300,14 @@ class COSVM(BaseSVM):
         """
         Numerically stabilize a theoretically PSD matrix.
 
-        Small negative eigenvalues can appear because of floating-point
-        arithmetic. They are clipped to zero if they are within psd_tol.
-
-        A genuinely negative eigenvalue larger than the tolerance is
-        considered an error.
+        Negative eigenvalues within the relative tolerance
+        psd_tol * max(1, max |eig|) are rounding and are shifted to zero;
+        a more negative eigenvalue raises ValueError.
         """
-        K = 0.5 * (K + K.T)
-
-        eigenvalues = np.linalg.eigvalsh(K)
-        min_eigenvalue = float(np.min(eigenvalues))
-
-        if min_eigenvalue < -self.psd_tol:
-            raise ValueError(
-                "The COSVM modified kernel matrix is not positive "
-                "semidefinite. "
-                f"Minimum eigenvalue: {min_eigenvalue:.3e}"
-            )
-
-        if min_eigenvalue < 0.0:
-            # Numerical correction only.
-            K = K - min_eigenvalue * np.eye(K.shape[0])
-
-        return K
+        return stabilize_psd(
+            K,
+            self.psd_tol,
+        )
 
     # ------------------------------------------------------------------
     # Fitting
@@ -368,6 +334,8 @@ class COSVM(BaseSVM):
         self
             Fitted COSVM estimator.
         """
+        validate_eta(self.eta)
+
         X_arr = check_array(X)
 
         n_samples, n_features = X_arr.shape
@@ -378,6 +346,7 @@ class COSVM(BaseSVM):
             )
 
         self.X_train_ = X_arr.copy()
+        self.n_features_in_ = n_features
 
         # --------------------------------------------------------------
         # Kernel
@@ -414,151 +383,41 @@ class COSVM(BaseSVM):
         )
 
         # --------------------------------------------------------------
-        # COSVM modified kernel
+        # COSVM dual Gram G = K A^{-1} K
         # --------------------------------------------------------------
 
-        self.K_tilde_ = (
-            self._compute_covariance_kernel_matrix(
-                self.K_train_
-            )
+        self.geometry_ = COSVMGeometry(
+            self.K_train_,
+            self.eta,
+            reg=self.reg,
         )
 
-        self.K_tilde_ = (
-            self._stabilize_psd_matrix(
-                self.K_tilde_
-            )
+        self.K_tilde_ = self._stabilize_psd_matrix(
+            self.geometry_.G
         )
 
         # --------------------------------------------------------------
         # Dual optimization
         #
-        # min 1/2 alpha^T K_tilde alpha
+        # min 1/2 alpha^T G alpha
         #
         # s.t.
         #       0 <= alpha_i <= C
         #       sum(alpha_i) = 1
         # --------------------------------------------------------------
 
-        def objective(alpha: np.ndarray) -> float:
-            return 0.5 * float(
-                alpha @ self.K_tilde_ @ alpha
-            )
-
-        def gradient(alpha: np.ndarray) -> np.ndarray:
-            return self.K_tilde_ @ alpha
-
-        constraints = [
-            {
-                "type": "eq",
-                "fun": lambda alpha: (
-                    np.sum(alpha) - 1.0
-                ),
-                "jac": lambda alpha: (
-                    np.ones_like(alpha)
-                ),
-            }
-        ]
-
-        bounds = [
-            (0.0, self.C_)
-            for _ in range(n_samples)
-        ]
-
-        # Uniform solution:
-        #
-        # alpha_i = 1/N
-        #
-        # This is feasible because:
-        #
-        # 1/N <= 1/(nu N)
-        #
-        # for nu <= 1.
-        x0 = np.full(
-            n_samples,
-            1.0 / n_samples,
-            dtype=float,
-        )
-
-        result = minimize(
-            fun=objective,
-            x0=x0,
-            jac=gradient,
-            bounds=bounds,
-            constraints=constraints,
-            method="SLSQP",
-            options={
-                "maxiter": self.max_iter,
-                "ftol": self.tol,
-                "disp": False,
-            },
+        alpha, result = solve_oneclass_dual(
+            self.K_tilde_,
+            self.C_,
+            x0=None,
+            ftol=min(self.tol, 1e-10),
+            max_iter=self.max_iter,
         )
 
         self.optimization_result_ = result
 
-        # --------------------------------------------------------------
-        # Never silently use an unsuccessful optimization result.
-        # --------------------------------------------------------------
-
-        if not result.success:
-            raise RuntimeError(
-                "COSVM optimization failed: "
-                f"{result.message}"
-            )
-
-        alpha = np.asarray(
-            result.x,
-            dtype=float,
-        )
-
-        # --------------------------------------------------------------
-        # Numerical cleanup
-        # --------------------------------------------------------------
-
-        alpha[np.abs(alpha) < self.sv_tol] = 0.0
-
-        # Check feasibility BEFORE doing anything else.
-        sum_error = abs(
-            np.sum(alpha) - 1.0
-        )
-
-        lower_violation = np.min(alpha)
-
-        upper_violation = np.max(
-            alpha - self.C_
-        )
-
-        feasibility_tol = max(
-            self.tol * 10.0,
-            1e-8,
-        )
-
-        if sum_error > feasibility_tol:
-            raise RuntimeError(
-                "COSVM optimizer returned an infeasible solution: "
-                f"|sum(alpha)-1| = {sum_error:.3e}"
-            )
-
-        if lower_violation < -feasibility_tol:
-            raise RuntimeError(
-                "COSVM optimizer returned alpha < 0: "
-                f"minimum alpha = {lower_violation:.3e}"
-            )
-
-        if upper_violation > feasibility_tol:
-            raise RuntimeError(
-                "COSVM optimizer returned alpha > C: "
-                f"maximum violation = {upper_violation:.3e}"
-            )
-
-        # Tiny numerical violations are clipped only after feasibility
-        # has been checked.
-        alpha = np.clip(
-            alpha,
-            0.0,
-            self.C_,
-        )
-
         self.alpha_ = alpha
+        self.coef_ = self.geometry_.coef(alpha)
 
         # --------------------------------------------------------------
         # Support vectors
@@ -586,15 +445,8 @@ class COSVM(BaseSVM):
         )
 
         # --------------------------------------------------------------
-        # Estimate rho using free support vectors
-        #
-        # For 0 < alpha_i < C:
-        #
-        #     sum_j alpha_j Ktilde_ij - rho = 0
-        #
-        # therefore:
-        #
-        #     rho = sum_j alpha_j Ktilde_ij.
+        # rho from the KKT conditions (free support vectors satisfy
+        # (G alpha)_i = rho).
         # --------------------------------------------------------------
 
         self._compute_rho()
@@ -609,114 +461,18 @@ class COSVM(BaseSVM):
         """
         Compute the decision-function offset rho.
 
-        Prefer free support vectors:
-
-            0 < alpha_i < C.
-
-        If there are no free support vectors, use the KKT interval
-        implied by the lower- and upper-bound coefficients.
+        Prefer free support vectors (0 < alpha_i < C, where
+        (G alpha)_i = rho). If there are none, use the midpoint of the
+        KKT interval [max_{alpha_i = C} (G alpha)_i,
+        min_{alpha_i = 0} (G alpha)_i].
         """
         check_is_fitted(self)
 
-        alpha = self.alpha_
-        K_tilde = self.K_tilde_
-
-        scores_train = (
-            K_tilde @ alpha
+        rho = compute_rho(
+            self.K_tilde_,
+            self.alpha_,
+            self.C_,
         )
-
-        alpha_tol = max(
-            self.sv_tol,
-            self.tol * 10.0,
-        )
-
-        # Free support vectors:
-        #
-        #     0 < alpha_i < C
-        #
-        free_mask = (
-            (alpha > alpha_tol)
-            & (alpha < self.C_ - alpha_tol)
-        )
-
-        free_indices = np.flatnonzero(
-            free_mask
-        )
-
-        if free_indices.size > 0:
-            rho = float(
-                np.mean(
-                    scores_train[
-                        free_indices
-                    ]
-                )
-            )
-
-        else:
-            # ----------------------------------------------------------
-            # No free support vectors.
-            #
-            # KKT conditions imply:
-            #
-            # alpha_i = 0  => score_i >= rho
-            # alpha_i = C  => score_i <= rho
-            #
-            # Therefore rho lies between:
-            #
-            # max(score_i : alpha_i = C)
-            #
-            # and
-            #
-            # min(score_i : alpha_i = 0).
-            # ----------------------------------------------------------
-
-            upper_bound_mask = (
-                alpha <= alpha_tol
-            )
-
-            lower_bound_mask = (
-                alpha >= self.C_ - alpha_tol
-            )
-
-            upper_values = scores_train[
-                upper_bound_mask
-            ]
-
-            lower_values = scores_train[
-                lower_bound_mask
-            ]
-
-            if (
-                lower_values.size > 0
-                and upper_values.size > 0
-            ):
-                rho_lower = float(
-                    np.max(lower_values)
-                )
-
-                rho_upper = float(
-                    np.min(upper_values)
-                )
-
-                rho = 0.5 * (
-                    rho_lower + rho_upper
-                )
-
-            elif lower_values.size > 0:
-                rho = float(
-                    np.mean(lower_values)
-                )
-
-            elif upper_values.size > 0:
-                rho = float(
-                    np.mean(upper_values)
-                )
-
-            else:
-                # Extremely unlikely fallback.
-                rho = float(
-                    np.mean(scores_train)
-                )
 
         self.rho_ = rho
 
@@ -727,38 +483,24 @@ class COSVM(BaseSVM):
         self.intercept_ = -rho
 
     # ------------------------------------------------------------------
-    # Modified test kernel
+    # Test kernels
     # ------------------------------------------------------------------
 
-    def _transform_test_kernel(
+    def _test_kernel(
         self,
         X_test: np.ndarray,
     ) -> np.ndarray:
         """
-        Compute the covariance-guided kernel between test samples
-        and training samples.
-
-        For X_test:
-
-            K_test = k(X_test, X_train)
-
-        the modified kernel is:
-
-            Ktilde_test
-                = eta K_test
-                + (1 - eta) K_test H K_train^T
-
-        where
-
-            H = I - (1/N)11^T.
+        Raw kernel k(X_test, X_train).
         """
         check_is_fitted(self)
 
         X_test_arr = check_array(
-            X_test
+            X_test,
+            n_features=getattr(self, "n_features_in_", None),
         )
 
-        K_test = np.asarray(
+        return np.asarray(
             self.kernel_(
                 X_test_arr,
                 self.X_train_,
@@ -766,53 +508,27 @@ class COSVM(BaseSVM):
             dtype=float,
         )
 
-        # Standard OCSVM case.
-        if self.eta == 1.0:
+    def _transform_test_kernel(
+        self,
+        X_test: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Dual cross-Gram between test and training samples,
+
+            G(X_test, X_train) = k(X_test, X_train) A^{-1} K,
+
+        the rectangular counterpart of G (its rows on training points are
+        rows of G). score(x) = G(x, X_train) alpha = k(x, X_train) coef_.
+        """
+        K_test = self._test_kernel(X_test)
+
+        if self.geometry_.cho_ is None:
             return K_test
 
-        n_samples = (
-            self.X_train_.shape[0]
+        return K_test @ cho_solve(
+            self.geometry_.cho_,
+            self.K_train_,
         )
-
-        if n_samples <= 1:
-            return K_test
-
-        # --------------------------------------------------------------
-        # K_test H
-        #
-        # H = I - 11^T/N
-        #
-        # Therefore:
-        #
-        # K_test H
-        # = K_test - row_mean(K_test)
-        # --------------------------------------------------------------
-
-        K_test_centered = (
-            K_test
-            - np.mean(
-                K_test,
-                axis=1,
-                keepdims=True,
-            )
-        )
-
-        # --------------------------------------------------------------
-        # K_test H K_train^T
-        # --------------------------------------------------------------
-
-        covariance_component = (
-            K_test_centered
-            @ self.K_train_.T
-        )
-
-        K_tilde_test = (
-            self.eta * K_test
-            + (1.0 - self.eta)
-            * covariance_component
-        )
-
-        return K_tilde_test
 
     # ------------------------------------------------------------------
     # Scoring
@@ -830,20 +546,10 @@ class COSVM(BaseSVM):
         scores : ndarray of shape (n_samples,)
             Raw score:
 
-                sum_i alpha_i Ktilde(x, x_i)
+                k(x, X_train)^T coef_ = k(x, X_train)^T A^{-1} K alpha
         """
-        check_is_fitted(self)
-
-        X_arr = check_array(X)
-
-        K_tilde_test = (
-            self._transform_test_kernel(
-                X_arr
-            )
-        )
-
         return (
-            K_tilde_test @ self.alpha_
+            self._test_kernel(X) @ self.coef_
         )
 
     def decision_function(
@@ -853,9 +559,7 @@ class COSVM(BaseSVM):
         """
         Compute the signed COSVM decision function.
 
-            f(x)
-              = sum_i alpha_i Ktilde(x, x_i)
-                - rho
+            f(x) = k(x, X_train)^T coef_ - rho
 
         Positive values indicate normal samples.
 
@@ -907,7 +611,8 @@ class COSVM(BaseSVM):
         """
         Search for eta using the training outlier fraction.
 
-        The search starts from eta=1 and moves toward eta=0.
+        The search starts from eta=1 and moves toward eta=0 (eta = 0
+        itself is excluded, see the class docstring).
 
         Parameters
         ----------
@@ -958,6 +663,11 @@ class COSVM(BaseSVM):
             -eta_step / 2.0,
             -eta_step,
         )
+
+        # eta must stay in (0, 1].
+        eta_values = eta_values[
+            eta_values > 1e-12
+        ]
 
         for eta in eta_values:
             eta = float(

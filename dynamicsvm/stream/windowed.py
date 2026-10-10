@@ -55,6 +55,9 @@ class SlidingWindowSVM(StreamingSVM):
         X_arr = np.asarray(X, dtype=float)
         y_arr = np.asarray(y)
 
+        if X_arr.ndim == 2:
+            self.n_features_in_ = X_arr.shape[1]
+
         self._buffer_X.clear()
         self._buffer_y.clear()
 
@@ -72,6 +75,8 @@ class SlidingWindowSVM(StreamingSVM):
         Incrementally add a new sample to the window, evicting the oldest if full.
         """
         x_vec = np.asarray(x, dtype=float).ravel()
+        if getattr(self, "n_features_in_", None) is None:
+            self.n_features_in_ = len(x_vec)
         self._buffer_X.append(x_vec)
         self._buffer_y.append(y)
         self._last_known_class = y
@@ -119,13 +124,13 @@ class SlidingWindowSVM(StreamingSVM):
         self.n_support_ = self._model.n_support_
 
     def decision_function(self, X: np.ndarray) -> np.ndarray:
-        X_arr = check_array(X)
+        X_arr = check_array(X, n_features=getattr(self, "n_features_in_", None))
         if self._model is not None and self._model.is_fitted:
             return self._model.decision_function(X_arr)
         return np.zeros(X_arr.shape[0])
 
     def predict(self, X: np.ndarray) -> np.ndarray:
-        X_arr = check_array(X)
+        X_arr = check_array(X, n_features=getattr(self, "n_features_in_", None))
         if self._model is not None and self._model.is_fitted:
             return self._model.predict(X_arr)
         

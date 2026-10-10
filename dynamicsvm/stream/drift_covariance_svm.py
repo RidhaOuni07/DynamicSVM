@@ -26,10 +26,21 @@ class DriftAwareCovarianceSVM(StreamingSVM):
     
     Architecture:
     1. Pretrained/Frozen Representation Encoder: maps $x \to z$ to provide a stable coordinate system.
-    2. Online Latent Mean & Covariance Tracker: tracks $\mu_t, \Sigma_t$ with drift-adaptive exponential forgetting.
-    3. Latent Drift Detector: computes $D_t = \lambda_\mu \|\mu_B - \mu_t\|^2 + \lambda_\Sigma \|\Sigma_B - \Sigma_t\|_F^2$.
-    4. Decremental Unlearning via Obsolescence Scoring: $O_i = \lambda_A A_i + \lambda_T T_i + \lambda_D D_i$.
-    5. Covariance-Aware SVM Decision Boundary: $Q_t = \eta K_t + (1 - \eta) K_t H_t K_t^T$.
+    2. Online Latent Mean & Covariance Tracker: tracks $\mu_t, \Sigma_t$ with unbiased
+       exponentially weighted estimates and drift-adaptive forgetting.
+    3. Latent Drift Detector: each new $z_t$ is scored by the calibrated surprise
+       $D_t = -\log_{10} p_t$, $p_t$ the Hotelling predictive p-value of $z_t$ under
+       $(\mu_{t-1}, \Sigma_{t-1}, n_{\text{eff}})$ (see ``OnlineCovarianceTracker``).
+       After a confirmed drift the detector is reset, which imposes a refractory
+       warm-up of ``min_instances`` checks.
+    4. Decremental Unlearning via Obsolescence Scoring: $O_i = \lambda_A A_i + \lambda_T T_i + \lambda_D D_i$
+       (heuristic ranking, see ``ObsolescenceScorer``).
+    5. Covariance-Aware SVM Decision Boundary: $Q_t = \eta K_t + (1 - \eta) s K_t H_t K_t$
+       (see ``CovarianceAwareSVC``).
+
+    Every ``learn_one`` step refits ``CovarianceAwareSVC`` exactly on the current
+    buffer (batch re-solve); "incremental/decremental" refers to buffer insertion
+    and removal, not to an incremental update of the dual solution.
     
     Parameters
     ----------
@@ -50,9 +61,10 @@ class DriftAwareCovarianceSVM(StreamingSVM):
     min_buffer_size : int, default=10
         Minimum samples needed before training SVM classifier.
     drift_threshold : float, default=3.0
-        Threshold on $D_t$ to confirm distribution drift.
-    warning_threshold : float, default=1.5
-        Threshold on $D_t$ for drift warning.
+        Drift is confirmed when $D_t = -\log_{10} p_t \ge$ drift_threshold
+        (default: p < 0.001 per step under stationarity).
+    warning_threshold : float, default=2.0
+        Drift warning when $D_t \ge$ warning_threshold (default: p < 0.01).
     lambda_base : float, default=0.95
         Baseline forgetting factor $\lambda_0$ for covariance tracker.
     lambda_min : float, default=0.50
@@ -80,7 +92,7 @@ class DriftAwareCovarianceSVM(StreamingSVM):
         max_buffer_size: int = 200,
         min_buffer_size: int = 10,
         drift_threshold: float = 3.0,
-        warning_threshold: float = 1.5,
+        warning_threshold: float = 2.0,
         lambda_base: float = 0.95,
         lambda_min: float = 0.50,
         lambda_age: float = 0.3,
@@ -134,6 +146,8 @@ class DriftAwareCovarianceSVM(StreamingSVM):
         """
         X_arr, y_arr = check_X_y(X, y)
         self.classes_ = np.unique(y_arr)
+        # Raw input feature count (before encoding)
+        self.n_features_in_ = X_arr.shape[1]
 
         if len(self.classes_) != 2:
             raise ValueError(f"Binary classification required. Found classes {self.classes_}")
@@ -157,6 +171,13 @@ class DriftAwareCovarianceSVM(StreamingSVM):
             warning_threshold=self.warning_threshold,
             drift_threshold=self.drift_threshold,
         )
+        # The tracker is already estimated from the whole initial batch, so the
+        # calibrated D_t is valid from the first streamed sample: skip the
+        # initial warm-up (it still applies as a refractory period after each
+        # confirmed drift, see learn_one). Otherwise a shift arriving with the
+        # first samples is absorbed by the tracker (lambda -> lambda_min) before
+        # any check is allowed to fire.
+        self.drift_detector_.n_checks_ = self.drift_detector_.min_instances
 
         self.obsolescence_scorer_ = ObsolescenceScorer(
             lambda_age=self.lambda_age,
@@ -190,6 +211,13 @@ class DriftAwareCovarianceSVM(StreamingSVM):
             return
 
         active_cov = self.covariance_tracker_.cov_ if self.covariance_tracker_ is not None else None
+        # The tracker supplies only the metric Sigma^{-1}. Z is centred with the
+        # buffer mean (CovarianceAwareSVC default), so H = C_N Z Sigma^{-1} Z^T C_N / d
+        # satisfies H 1 = 0 and the covariance term is invariant to translations
+        # of the buffer. Centring with the EW tracker mean instead would leave a
+        # rank-one term in (buffer mean - tracker mean), which is non-zero after
+        # pruning.
+        active_mean = None
 
         self.base_svm_ = CovarianceAwareSVC(
             C=self.C,
@@ -199,7 +227,7 @@ class DriftAwareCovarianceSVM(StreamingSVM):
             solver=self.solver,
             random_state=self.random_state,
         )
-        self.base_svm_.fit(Z_active, y_active, cov=active_cov)
+        self.base_svm_.fit(Z_active, y_active, cov=active_cov, mean=active_mean)
 
         # Sync base attributes
         self.support_vectors_ = self.base_svm_.support_vectors_
@@ -282,10 +310,14 @@ class DriftAwareCovarianceSVM(StreamingSVM):
                 {
                     "time": self.current_time_step_,
                     "D_t": D_t,
+                    "p_value": self.covariance_tracker_.last_p_value_,
                     "lambda_t": lambda_t,
                     "retired_samples": n_retire,
                 }
             )
+            # Refractory warm-up: one regime change triggers one pruning, not
+            # one per sample while the tracker catches up with the new regime.
+            self.drift_detector_.reset()
 
         # Buffer capacity maintenance
         if len(self._buffer_X) >= self.max_buffer_size:
@@ -306,7 +338,7 @@ class DriftAwareCovarianceSVM(StreamingSVM):
         """
         Incrementally learn a batch of new incoming samples (X, y).
         """
-        X_arr = check_array(X)
+        X_arr = check_array(X, n_features=getattr(self, "n_features_in_", None))
         y_arr = np.asarray(y)
         for xi, yi in zip(X_arr, y_arr):
             self.learn_one(xi, yi)
@@ -318,21 +350,24 @@ class DriftAwareCovarianceSVM(StreamingSVM):
         x -> frozen encoder -> z -> CovarianceAwareSVC -> f(z)
         """
         check_is_fitted(self)
-        X_arr = check_array(X)
+        X_arr = check_array(X, n_features=getattr(self, "n_features_in_", None))
         Z = self.encoder.encode(X_arr)
         return self.base_svm_.decision_function(Z)
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Predict class labels for input samples X."""
         check_is_fitted(self)
-        X_arr = check_array(X)
+        X_arr = check_array(X, n_features=getattr(self, "n_features_in_", None))
         Z = self.encoder.encode(X_arr)
         return self.base_svm_.predict(Z)
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        """Predict class probabilities for input samples X."""
+        """
+        Class probabilities for input samples X: an uncalibrated logistic of
+        the margin, 1 / (1 + exp(-f(x))) (see CovarianceAwareSVC.predict_proba).
+        """
         check_is_fitted(self)
-        X_arr = check_array(X)
+        X_arr = check_array(X, n_features=getattr(self, "n_features_in_", None))
         Z = self.encoder.encode(X_arr)
         return self.base_svm_.predict_proba(Z)
 

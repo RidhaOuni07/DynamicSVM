@@ -3,8 +3,11 @@ Sequential Minimal Optimization (SMO) algorithm for Support Vector Machines.
 Based on John Platt's 1998 SMO paper and subsequent enhancements.
 """
 
+import warnings
 from typing import Optional, Tuple
 import numpy as np
+
+from dynamicsvm.utils.kkt import compute_intercept, kkt_gap
 
 
 class SMOSolver:
@@ -97,8 +100,23 @@ class SMOSolver:
 
             n_iters += 1
 
+        self.converged_ = not (n_iters >= self.max_iter and num_changed > 0)
+        if not self.converged_:
+            warnings.warn(
+                f"SMOSolver stopped after max_iter={self.max_iter} outer passes with "
+                f"KKT violations remaining; the solution may not be optimal.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        # Snap multipliers that are within round-off of a bound onto the bound
+        snap = 1e-12 * self.C
+        alpha[np.abs(alpha) < snap] = 0.0
+        alpha[np.abs(alpha - self.C) < snap] = self.C
+
         # Final refined intercept calculation using margin support vectors
         b = self._compute_intercept(alpha, K, y, fallback_b=b_container[0])
+        self.kkt_gap_ = kkt_gap(alpha, K, y, self.C)
 
         return alpha, b, n_iters
 
@@ -275,16 +293,17 @@ class SMOSolver:
         y: np.ndarray,
         fallback_b: float = 0.0,
     ) -> float:
-        """Compute exact intercept b using margin support vectors (0 < alpha_i < C)."""
+        """
+        Compute the intercept b from the KKT conditions.
+
+        Mean of y_i - f_i over margin support vectors (0 < alpha_i < C); with
+        no margin SVs, the midpoint of the admissible KKT interval [L, U]
+        (see :func:`dynamicsvm.utils.kkt.compute_intercept`).
+        """
         ay = alpha * y
         margin_sv = np.where((alpha > self.eps) & (alpha < self.C - self.eps))[0]
         if len(margin_sv) > 0:
             b_values = y[margin_sv] - np.dot(K[margin_sv, :], ay)
             return float(np.mean(b_values))
 
-        sv = np.where(alpha > self.eps)[0]
-        if len(sv) > 0:
-            b_values = y[sv] - np.dot(K[sv, :], ay)
-            return float(np.mean(b_values))
-
-        return float(fallback_b)
+        return compute_intercept(alpha, K, y, self.C, eps=1e-8 * self.C, fallback_b=fallback_b)

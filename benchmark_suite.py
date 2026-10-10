@@ -54,7 +54,7 @@ def run_all_benchmarks():
     print("\n[Benchmark 1] Optimization Solvers on Non-linear Two Moons (N=200)")
     solvers = {
         "SMO (Platt / Keerthi)": SVC(C=2.0, kernel="rbf", gamma=1.0, solver="smo", random_state=42),
-        "QP (Exact Dual Solver)": SVC(C=2.0, kernel="rbf", gamma=1.0, solver="qp"),
+        "QP (SLSQP, KKT-checked)": SVC(C=2.0, kernel="rbf", gamma=1.0, solver="qp"),
         "LASVM (Active Online SMO)": LASVM(C=2.0, kernel="rbf", gamma=1.0, epochs=2, selection_strategy="active", random_state=42),
         "Covariance-Aware SVC": CovarianceAwareSVC(C=2.0, eta=0.7, kernel="rbf", gamma=1.0),
     }
@@ -79,7 +79,7 @@ def run_all_benchmarks():
             eta=0.7,
             max_buffer_size=50,
             min_buffer_size=15,
-            drift_threshold=0.35,
+            drift_threshold=3.0,  # -log10 p scale: p < 0.001
             random_state=42,
         ),
     }
@@ -128,7 +128,7 @@ def run_all_benchmarks():
     anomaly_models = {
         "Standard Baseline OCSVM (eta=1.0)": COSVM(nu=0.1, eta=1.0, kernel="rbf", gamma="scale"),
         "Covariance-Guided COSVM (eta=0.4)": COSVM(nu=0.1, eta=0.4, kernel="rbf", gamma="scale"),
-        "Incremental ICOSVM (KKT R matrix)": ICOSVM(nu=0.1, eta=0.4, kernel="rbf", gamma="scale", max_samples=150),
+        "ICOSVM (warm-started re-solve)": ICOSVM(nu=0.1, eta=0.4, kernel="rbf", gamma="scale", max_samples=150),
         "Incremental/Decremental IDCOSVM": IncrementalDecrementalCOSVM(nu=0.1, eta=0.4, kernel="rbf", gamma="scale"),
     }
 

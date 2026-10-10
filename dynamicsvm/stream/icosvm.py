@@ -11,23 +11,22 @@ Based on:
 
     Pattern Recognition 91 (2019): 308-321.
 
-The implementation maintains a COSVM model over a growing stream.
+The implementation maintains a COSVM model over a growing (optionally
+windowed) stream.
 
-Important mathematical definitions
------------------------------------
+Mathematical definitions
+------------------------
 
-For N training samples:
+ICOSVM shares the formulation of :class:`dynamicsvm.models.cosvm.COSVM`
+(derivation in ``dynamicsvm.models._cosvm_core``). For the N buffered
+samples, H = I - (1/N) 11^T and
 
-    H = I - (1/N) 11^T
-
-and
-
-    K_tilde = eta K + (1 - eta) K H K^T.
+    G = K A^{-1} K,   A = eta K + ((1 - eta)/N) K H K,   0 < eta <= 1.
 
 The dual optimization problem is:
 
     minimize
-        1/2 alpha^T K_tilde alpha
+        1/2 alpha^T G alpha
 
     subject to
 
@@ -37,54 +36,121 @@ The dual optimization problem is:
 
 where
 
-        C = 1 / (nu N).
+        C = 1 / (nu N),
+
+and the decision function is f(x) = k(x, X)^T A^{-1} K alpha - rho.
 
 The KKT gradient is
 
-    g_i = sum_j K_tilde[i,j] alpha_j - rho.
+    g_i = (G alpha)_i - rho,
 
-The three standard sets are:
+with the three standard sets
 
-    S:
-        0 < alpha_i < C
+    S:  0 < alpha_i < C   (g_i = 0)
+    E:  alpha_i = C       (g_i <= 0)
+    O:  alpha_i = 0       (g_i >= 0)
 
-    E:
-        alpha_i = C
+What an update does
+-------------------
+Every learn_one / unlearn_one is a warm-started exact re-solve of the
+current finite COSVM dual. Adding or removing a sample changes N, hence
+C = 1/(nu N), H and A^{-1}, and therefore every entry of G: the previous
+alpha is in general not KKT for the new problem, and the single-candidate
+Cauwenberghs-Poggio path does not apply. The update therefore
 
-    O:
-        alpha_i = 0
+1. rebuilds K, G and the Cholesky factor of A (O(N^3));
+2. tries a KKT predictor: the previous alpha extended by alpha_c = 0,
+   followed by one sensitivity step on the candidate c over the current
+   margin set S, using the bordered system
 
-For a candidate sample c entering through an incremental KKT update,
-the sensitivity system is built from the free support vectors S:
+       [ 0     1^T  ] [ beta_0 ]      [ 1    ]
+       [ 1     G_SS ] [ beta_S ] =  - [ G_Sc ],
 
-    [ 0       1^T ] [d rho / d alpha_c]   [1]
-    [ 1       K_SS] [d alpha_S / d alpha_c] = -[K_Sc]
+   d alpha_S / d alpha_c = beta_S, d rho / d alpha_c = -beta_0 and
+   d g_c / d alpha_c = G_cc + beta_0 + G_cS beta_S. The predictor is
+   accepted only if the complete KKT check of the NEW problem passes and
+   no coefficient leaves the box (no clipping);
+3. otherwise re-solves the dual exactly (SLSQP from the feasible warm
+   start, refined to the KKT conditions).
 
-The implementation uses the equivalent augmented matrix formulation
-and verifies the resulting state numerically.
-
-Notes
------
-Because the covariance-guided kernel itself depends on the complete
-dataset, adding a sample changes H and therefore changes K_tilde
-globally. Consequently, an exact incremental COSVM implementation
-must account for this global covariance update.
-
-This implementation therefore uses KKT updates as the primary
-incremental mechanism and performs a full QP correction only when
-the resulting state is no longer sufficiently feasible/KKT-consistent.
-This provides a robust research implementation while preserving the
-incremental architecture.
+Because G changes globally with N, the predictor is rarely accepted for
+eta < 1 (for eta = 1, G = K does not change for the old samples and it is
+accepted more often); ``n_incremental_updates_`` and ``n_qp_solves_``
+report how often each path ran. After a re-solve the model equals batch
+COSVM on the same buffer and kernel to solver precision; after an accepted
+predictor it satisfies the KKT conditions of that problem to ``kkt_tol``.
+The cost of an update is that of a batch fit (O(N^3)), not O(N_s^2).
 """
 
-from typing import Callable, List, Optional, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import numpy as np
-from scipy.optimize import minimize
+from scipy.linalg import cho_solve
 
 from dynamicsvm.base import BaseSVM
 from dynamicsvm.kernels import Kernel, get_kernel
+from dynamicsvm.models._cosvm_core import (
+    COSVMGeometry,
+    compute_rho,
+    feasible_start,
+    solve_oneclass_dual,
+    validate_eta,
+)
 from dynamicsvm.utils.validation import check_array, check_is_fitted
+
+
+def _sensitivity_step(
+    G: np.ndarray,
+    S: Union[List[int], np.ndarray],
+    c: int,
+) -> Optional[Tuple[float, np.ndarray, float]]:
+    """
+    Linear response of a one-class KKT state to increasing alpha_c.
+
+    Keeping (G alpha)_s - rho = 0 for s in S and sum(alpha) = 1 while
+    alpha_c grows requires
+
+        G_SS beta_S + G_Sc + beta_0 1 = 0,   1^T beta_S = -1,
+
+    i.e. beta = -M^{-1} [1; G_Sc] with M = [[0, 1^T], [1, G_SS]].
+
+    Returns
+    -------
+    (d_rho, d_alpha_S, d_g_c) or None
+        d_rho = -beta_0, d_alpha_S = beta_S and
+        d_g_c = G_cc + beta_0 + G_cS beta_S, all per unit increase of
+        alpha_c. None when M is singular.
+    """
+    G = np.asarray(G, dtype=float)
+    s_idx = np.asarray(S, dtype=int)
+    n_s = s_idx.size
+
+    M = np.zeros((n_s + 1, n_s + 1), dtype=float)
+    M[0, 1:] = 1.0
+    M[1:, 0] = 1.0
+    M[1:, 1:] = G[np.ix_(s_idx, s_idx)]
+
+    rhs = np.concatenate(([1.0], G[s_idx, c]))
+
+    try:
+        beta = -np.linalg.solve(M, rhs)
+    except np.linalg.LinAlgError:
+        return None
+
+    if not np.all(np.isfinite(beta)):
+        return None
+
+    beta_0 = float(beta[0])
+    beta_S = beta[1:]
+
+    d_rho = -beta_0
+    d_g_c = float(
+        G[c, c]
+        + beta_0
+        + G[c, s_idx] @ beta_S
+    )
+
+    return d_rho, beta_S, d_g_c
 
 
 class ICOSVM(BaseSVM):
@@ -98,23 +164,20 @@ class ICOSVM(BaseSVM):
         on the fraction of support vectors.
 
     eta : float, default=0.5
-        Trade-off between the standard kernel matrix and the
-        covariance-guided component.
+        Weight of the identity in the primal metric
+        M = eta I + (1 - eta) Sigma, in (0, 1].
 
             eta = 1:
                 Standard One-Class SVM.
 
-            eta = 0:
-                Pure covariance-guided component.
-
             0 < eta < 1:
-                Combined COSVM model.
+                Covariance-guided COSVM.
 
     kernel : {'rbf', 'linear', 'poly', 'sigmoid'} or Kernel or Callable
         Kernel specification.
 
     gamma : {'scale', 'auto'} or float, default='scale'
-        Kernel coefficient.
+        Kernel coefficient (resolved once, from the data given to fit).
 
     degree : int, default=3
         Polynomial kernel degree.
@@ -126,21 +189,24 @@ class ICOSVM(BaseSVM):
         Maximum number of samples retained in the stream window.
 
     tol : float, default=1e-5
-        Numerical tolerance.
+        Numerical tolerance. SLSQP runs at ftol = min(tol, 1e-10).
 
     max_iter : int, default=1000
-        Maximum number of iterations for the fallback QP solver.
+        Maximum number of SLSQP iterations of the exact re-solve.
 
     sv_tol : float, default=1e-7
         Support-vector classification tolerance.
 
     kkt_tol : float, default=1e-5
-        KKT feasibility tolerance.
+        KKT tolerance used to accept the predictor step.
 
     Attributes
     ----------
     alpha_ : ndarray
         Full dual coefficient vector.
+
+    coef_ : ndarray
+        Score coefficients A^{-1} K alpha; score(x) = k(x, X)^T coef_.
 
     support_ : ndarray
         Support-vector indices.
@@ -173,13 +239,27 @@ class ICOSVM(BaseSVM):
         Current kernel Gram matrix.
 
     K_tilde_full_ : ndarray
-        Current covariance-guided Gram matrix.
+        Current dual Gram matrix G = K A^{-1} K.
+
+    geometry_ : COSVMGeometry
+        Factorised geometry of the current buffer.
 
     R_ : ndarray or None
-        Inverse KKT sensitivity matrix.
+        Inverse of the bordered margin matrix [[0, 1^T], [1, G_SS]]
+        (diagnostic).
 
     n_samples_seen_ : int
-        Number of samples observed by the stream.
+        Number of samples observed by the stream (not decreased by
+        unlearning).
+
+    n_unlearned_ : int
+        Number of samples removed (unlearn_one or the sliding window).
+
+    n_incremental_updates_ : int
+        learn_one calls resolved by the accepted KKT predictor.
+
+    n_qp_solves_ : int
+        learn_one / unlearn_one calls resolved by an exact re-solve.
     """
 
     def __init__(
@@ -203,10 +283,7 @@ class ICOSVM(BaseSVM):
                 f"nu must be in (0, 1], got {nu}"
             )
 
-        if not (0.0 <= eta <= 1.0):
-            raise ValueError(
-                f"eta must be in [0, 1], got {eta}"
-            )
+        validate_eta(eta)
 
         if tol <= 0:
             raise ValueError(
@@ -263,6 +340,10 @@ class ICOSVM(BaseSVM):
             0,
             dtype=float,
         )
+        self.coef_: np.ndarray = np.empty(
+            0,
+            dtype=float,
+        )
 
         self.rho_: float = 0.0
         self.offset_: float = 0.0
@@ -276,8 +357,12 @@ class ICOSVM(BaseSVM):
 
         self.K_full_: Optional[np.ndarray] = None
         self.K_tilde_full_: Optional[np.ndarray] = None
+        self.geometry_: Optional[COSVMGeometry] = None
 
         self.n_samples_seen_: int = 0
+        self.n_unlearned_: int = 0
+        self.n_incremental_updates_: int = 0
+        self.n_qp_solves_: int = 0
 
         self.C_: float = 1.0
 
@@ -308,51 +393,22 @@ class ICOSVM(BaseSVM):
         K: np.ndarray,
     ) -> np.ndarray:
         """
-        Compute
+        Compute the COSVM dual Gram matrix
 
-            K_tilde
-                = eta K
-                + (1 - eta) K H K^T.
+            G = K A^{-1} K,   A = eta K + ((1 - eta)/N) K H K
+
+        (shared with COSVM / IDCOSVM, see ``_cosvm_core``).
         """
-        K = np.asarray(
-            K,
-            dtype=float,
-        )
-
-        n_samples = K.shape[0]
-
-        if n_samples <= 1:
-            return K.copy()
-
-        H = self._centering_matrix(
-            n_samples
-        )
-
-        covariance_component = (
-            K @ H @ K.T
-        )
-
-        K_tilde = (
-            self.eta * K
-            + (1.0 - self.eta)
-            * covariance_component
-        )
-
-        return 0.5 * (
-            K_tilde + K_tilde.T
-        )
+        return COSVMGeometry(K, self.eta).G
 
     def _recompute_full_matrices(
         self,
     ) -> None:
         """
-        Recompute the complete kernel and covariance-guided matrices.
+        Recompute the kernel matrix and the COSVM geometry.
 
-        This is necessary because adding/removing a sample changes:
-
-            H = I - 11^T/N
-
-        and therefore changes the covariance-guided matrix globally.
+        This is necessary because adding/removing a sample changes
+        N, H and A^{-1}, and therefore every entry of G.
         """
         X_mat = np.asarray(
             self.X_buffer_,
@@ -372,11 +428,12 @@ class ICOSVM(BaseSVM):
             + self.K_full_.T
         )
 
-        self.K_tilde_full_ = (
-            self._compute_covariance_kernel_matrix(
-                self.K_full_
-            )
+        self.geometry_ = COSVMGeometry(
+            self.K_full_,
+            self.eta,
         )
+
+        self.K_tilde_full_ = self.geometry_.G
 
     # ==================================================================
     # Batch QP solver
@@ -384,12 +441,15 @@ class ICOSVM(BaseSVM):
 
     def _solve_batch_qp(
         self,
+        x0: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
-        Solve the current COSVM dual problem exactly using SLSQP.
+        Solve the current COSVM dual problem exactly.
 
-        This method is used for initialization and as a numerical
-        correction when the incremental KKT state becomes unreliable.
+        SLSQP (ftol = min(tol, 1e-10)) starts from x0, or from the current
+        alpha_ when it has the right length, made feasible for the current
+        box by clipping and water-filling; the result is refined to the
+        KKT conditions (``_cosvm_core.solve_oneclass_dual``).
         """
         n_samples = len(
             self.X_buffer_
@@ -401,154 +461,27 @@ class ICOSVM(BaseSVM):
 
         self.C_ = C
 
-        K_tilde = self.K_tilde_full_
+        if x0 is None and self.alpha_.size == n_samples:
+            x0 = self.alpha_
 
-        def objective(
-            alpha: np.ndarray,
-        ) -> float:
-            return 0.5 * float(
-                alpha @ K_tilde @ alpha
-            )
+        start = feasible_start(
+            x0,
+            n_samples,
+            C,
+        )
 
-        def gradient(
-            alpha: np.ndarray,
-        ) -> np.ndarray:
-            return K_tilde @ alpha
-
-        constraint = {
-            "type": "eq",
-            "fun": lambda alpha: (
-                np.sum(alpha) - 1.0
-            ),
-            "jac": lambda alpha: (
-                np.ones_like(alpha)
-            ),
-        }
-
-        bounds = [
-            (0.0, C)
-            for _ in range(n_samples)
-        ]
-
-        # --------------------------------------------------------------
-        # Build a feasible starting point.
-        # --------------------------------------------------------------
-
-        if (
-            self.alpha_.size == n_samples
-            and np.sum(self.alpha_) > 0
-        ):
-            x0 = np.clip(
-                self.alpha_,
-                0.0,
-                C,
-            )
-
-            # Normalization can violate upper bounds.
-            # Therefore only use the previous state if it is already
-            # approximately feasible.
-            if (
-                abs(np.sum(x0) - 1.0)
-                <= self.kkt_tol
-                and np.max(x0)
-                <= C + self.kkt_tol
-            ):
-                # Repair tiny sum error without blindly normalizing.
-                correction = (
-                    1.0 - np.sum(x0)
-                )
-
-                if abs(correction) > 0:
-                    free = np.flatnonzero(
-                        x0 < C - self.kkt_tol
-                    )
-
-                    if free.size > 0:
-                        x0[free[0]] += correction
-
-                if (
-                    np.min(x0) >= -self.kkt_tol
-                    and np.max(x0)
-                    <= C + self.kkt_tol
-                ):
-                    pass
-                else:
-                    x0 = np.full(
-                        n_samples,
-                        1.0 / n_samples,
-                    )
-            else:
-                x0 = np.full(
-                    n_samples,
-                    1.0 / n_samples,
-                )
-        else:
-            x0 = np.full(
-                n_samples,
-                1.0 / n_samples,
-            )
-
-        result = minimize(
-            fun=objective,
-            x0=x0,
-            jac=gradient,
-            bounds=bounds,
-            constraints=[constraint],
-            method="SLSQP",
-            options={
-                "maxiter": self.max_iter,
-                "ftol": self.tol,
-                "disp": False,
-            },
+        alpha, result = solve_oneclass_dual(
+            self.K_tilde_full_,
+            C,
+            x0=start,
+            ftol=min(self.tol, 1e-10),
+            max_iter=self.max_iter,
         )
 
         self.optimization_result_ = result
 
-        if not result.success:
-            raise RuntimeError(
-                "ICOSVM batch QP failed: "
-                f"{result.message}"
-            )
-
-        alpha = np.asarray(
-            result.x,
-            dtype=float,
-        )
-
-        # --------------------------------------------------------------
-        # Numerical cleanup without blindly renormalizing.
-        # --------------------------------------------------------------
-
-        alpha[
-            np.abs(alpha) < self.sv_tol
-        ] = 0.0
-
-        if np.min(alpha) < -self.kkt_tol:
-            raise RuntimeError(
-                "QP returned alpha < 0."
-            )
-
-        if np.max(alpha - C) > self.kkt_tol:
-            raise RuntimeError(
-                "QP returned alpha > C."
-            )
-
-        if (
-            abs(np.sum(alpha) - 1.0)
-            > self.kkt_tol
-        ):
-            raise RuntimeError(
-                "QP returned an infeasible "
-                "sum(alpha) constraint."
-            )
-
-        alpha = np.clip(
-            alpha,
-            0.0,
-            C,
-        )
-
         self.alpha_ = alpha
+        self.coef_ = self.geometry_.coef(alpha)
 
         return alpha
 
@@ -604,13 +537,15 @@ class ICOSVM(BaseSVM):
         self,
     ) -> None:
         """
-        Build the inverse sensitivity matrix:
+        Build the inverse of the bordered margin matrix:
 
             R =
                 [ 0      1_S^T ]
-                [ 1_S    K_SS  ]^{-1}
+                [ 1_S    G_SS  ]^{-1}
 
-        A pseudoinverse is used only as a numerical fallback.
+        Diagnostic only; the predictor solves the system directly
+        (``_sensitivity_step``). A pseudoinverse is used only as a
+        numerical fallback.
         """
         if not self.S_set_:
             self.R_ = None
@@ -663,81 +598,16 @@ class ICOSVM(BaseSVM):
         self,
     ) -> None:
         """
-        Compute rho from the KKT conditions.
+        Compute rho from the KKT conditions (shared with COSVM/IDCOSVM).
 
-        For free support vectors:
-
-            Ktilde_i alpha - rho = 0.
-
-        If no free support vectors exist, use the KKT interval.
+        For free support vectors (G alpha)_i = rho; without free support
+        vectors the midpoint of the KKT interval is used.
         """
-        scores = (
-            self.K_tilde_full_
-            @ self.alpha_
+        rho = compute_rho(
+            self.K_tilde_full_,
+            self.alpha_,
+            self.C_,
         )
-
-        alpha = self.alpha_
-        C = self.C_
-
-        free = (
-            (alpha > self.sv_tol)
-            & (alpha < C - self.sv_tol)
-        )
-
-        free_idx = np.flatnonzero(
-            free
-        )
-
-        if free_idx.size > 0:
-            rho = float(
-                np.mean(
-                    scores[free_idx]
-                )
-            )
-
-        else:
-            zero_idx = np.flatnonzero(
-                alpha <= self.sv_tol
-            )
-
-            C_idx = np.flatnonzero(
-                alpha >= C - self.sv_tol
-            )
-
-            lower = (
-                np.max(
-                    scores[C_idx]
-                )
-                if C_idx.size > 0
-                else -np.inf
-            )
-
-            upper = (
-                np.min(
-                    scores[zero_idx]
-                )
-                if zero_idx.size > 0
-                else np.inf
-            )
-
-            if (
-                np.isfinite(lower)
-                and np.isfinite(upper)
-            ):
-                rho = 0.5 * (
-                    lower + upper
-                )
-
-            elif np.isfinite(lower):
-                rho = float(lower)
-
-            elif np.isfinite(upper):
-                rho = float(upper)
-
-            else:
-                rho = float(
-                    np.mean(scores)
-                )
 
         self.rho_ = rho
         self.offset_ = rho
@@ -753,20 +623,26 @@ class ICOSVM(BaseSVM):
         y: Optional[np.ndarray] = None,
     ) -> "ICOSVM":
         """
-        Initialize ICOSVM from an initial batch.
+        Initialize ICOSVM from an initial batch (n_samples >= 1).
 
         The initial model is solved using the exact batch COSVM dual.
+        With a single row and gamma='scale' the kernel falls back to
+        gamma = 1/n_features with a UserWarning (the variance of one
+        vector is not defined).
         """
+        validate_eta(self.eta)
+
         X_arr = check_array(X)
 
         n_samples, n_features = (
             X_arr.shape
         )
+        self.n_features_in_ = n_features
 
-        if n_samples < 2:
+        if n_samples < 1:
             raise ValueError(
-                "ICOSVM requires at least two "
-                "initial training samples."
+                "ICOSVM requires at least one "
+                "initial training sample."
             )
 
         # --------------------------------------------------------------
@@ -783,7 +659,7 @@ class ICOSVM(BaseSVM):
         )
 
         # --------------------------------------------------------------
-        # Buffer
+        # Buffer and counters
         # --------------------------------------------------------------
 
         self.X_buffer_ = [
@@ -792,6 +668,9 @@ class ICOSVM(BaseSVM):
         ]
 
         self.n_samples_seen_ = n_samples
+        self.n_unlearned_ = 0
+        self.n_incremental_updates_ = 0
+        self.n_qp_solves_ = 0
 
         # --------------------------------------------------------------
         # Kernel matrices
@@ -804,7 +683,7 @@ class ICOSVM(BaseSVM):
         )
 
         # --------------------------------------------------------------
-        # Exact initial COSVM solution
+        # Exact initial COSVM solution (uniform start, like COSVM.fit)
         # --------------------------------------------------------------
 
         self.alpha_ = np.full(
@@ -826,7 +705,7 @@ class ICOSVM(BaseSVM):
         return self
 
     # ==================================================================
-    # Incremental KKT update
+    # KKT predictor
     # ==================================================================
 
     def _incremental_candidate_update(
@@ -834,33 +713,27 @@ class ICOSVM(BaseSVM):
         candidate_index: int,
     ) -> bool:
         """
-        Attempt an incremental KKT update for a newly added candidate.
+        KKT predictor for a newly added candidate c (alpha_c = 0).
+
+        rho is recomputed for the new G; if the candidate violates its
+        O-set condition (g_c < 0), alpha_c is increased along the
+        sensitivity direction of ``_sensitivity_step`` until g_c = 0 or
+        alpha_c = C. A step that would move any alpha_S outside [0, C]
+        is rejected (no clipping).
 
         Returns
         -------
         success : bool
-            True if the candidate was incorporated while preserving
-            numerical feasibility.
-
-        Notes
-        -----
-        This is the sensitivity step. It should be regarded as the
-        fast path. The complete model is later verified.
+            True if a candidate state was produced. It is only a
+            prediction: the caller accepts it only if the complete KKT
+            check of the new problem passes.
         """
         c = candidate_index
 
-        n_samples = len(
-            self.X_buffer_
-        )
-
         C = self.C_
 
-        # --------------------------------------------------------------
-        # Current candidate starts at alpha_c = 0.
-        # --------------------------------------------------------------
-
-        alpha_old = self.alpha_.copy()
-        rho_old = self.rho_
+        self._compute_rho()
+        self._update_sets()
 
         g_c = float(
             self.K_tilde_full_[c]
@@ -870,164 +743,53 @@ class ICOSVM(BaseSVM):
 
         # Candidate already satisfies the O-set KKT condition.
         if g_c >= -self.kkt_tol:
-            self._update_sets()
             return True
 
-        # --------------------------------------------------------------
-        # There must be at least one free support vector to use the
-        # standard sensitivity system.
-        # --------------------------------------------------------------
-
-        if not self.S_set_:
-            return False
-
-        self._build_R_matrix()
-
-        if self.R_ is None:
-            return False
-
         s_idx = np.asarray(
-            self.S_set_,
+            [s for s in self.S_set_ if s != c],
             dtype=int,
         )
 
-        k_sc = (
-            self.K_tilde_full_[
-                s_idx,
-                c,
-            ]
-        )
-
-        # --------------------------------------------------------------
-        # Sensitivity vector.
-        #
-        # beta = -R [1, K_Sc]^T
-        #
-        # beta[0]:
-        #     sensitivity of rho
-        #
-        # beta[1:]:
-        #     sensitivities of alpha_S.
-        # --------------------------------------------------------------
-
-        rhs = np.concatenate(
-            (
-                np.array([1.0]),
-                k_sc,
-            )
-        )
-
-        beta = -(
-            self.R_ @ rhs
-        )
-
-        beta_rho = float(
-            beta[0]
-        )
-
-        beta_s = beta[1:]
-
-        # --------------------------------------------------------------
-        # Candidate gradient derivative.
-        # --------------------------------------------------------------
-
-        gamma = float(
-            self.K_tilde_full_[c, c]
-            - beta_rho
-            + np.dot(
-                k_sc,
-                beta_s,
-            )
-        )
-
-        if abs(gamma) < 1e-12:
+        if s_idx.size == 0:
             return False
 
-        # We need alpha_c to increase from zero until either:
-        #
-        # 1. g_c reaches zero, or
-        # 2. alpha_c reaches C.
-        #
-        delta_to_margin = (
-            -g_c / gamma
+        step = _sensitivity_step(
+            self.K_tilde_full_,
+            s_idx,
+            c,
         )
 
-        if delta_to_margin <= 0:
+        if step is None:
             return False
 
-        delta_to_C = C
+        d_rho, d_alpha_S, d_g_c = step
+
+        # g_c must increase towards 0 as alpha_c grows.
+        if d_g_c <= 1e-12:
+            return False
 
         delta = min(
-            delta_to_margin,
-            delta_to_C,
-        )
-
-        # --------------------------------------------------------------
-        # Apply candidate update.
-        # --------------------------------------------------------------
-
-        alpha_new = (
-            self.alpha_.copy()
-        )
-
-        alpha_new[c] += delta
-
-        alpha_new[s_idx] += (
-            beta_s * delta
-        )
-
-        rho_new = (
-            self.rho_
-            + beta_rho * delta
-        )
-
-        # --------------------------------------------------------------
-        # Feasibility checks.
-        # --------------------------------------------------------------
-
-        if (
-            np.min(alpha_new)
-            < -self.kkt_tol
-        ):
-            self.alpha_ = alpha_old
-            self.rho_ = rho_old
-            return False
-
-        if (
-            np.max(
-                alpha_new - C
-            )
-            > self.kkt_tol
-        ):
-            self.alpha_ = alpha_old
-            self.rho_ = rho_old
-            return False
-
-        if (
-            abs(
-                np.sum(alpha_new)
-                - 1.0
-            )
-            > self.kkt_tol
-        ):
-            self.alpha_ = alpha_old
-            self.rho_ = rho_old
-            return False
-
-        # --------------------------------------------------------------
-        # Commit.
-        # --------------------------------------------------------------
-
-        self.alpha_ = np.clip(
-            alpha_new,
-            0.0,
+            -g_c / d_g_c,
             C,
         )
 
-        self.rho_ = float(
-            rho_new
-        )
+        alpha_new = self.alpha_.copy()
 
+        alpha_new[c] = delta
+        alpha_new[s_idx] += d_alpha_S * delta
+
+        # Reject on any bound violation (no clipping).
+        if (
+            np.any(alpha_new[s_idx] < 0.0)
+            or np.any(alpha_new[s_idx] > C)
+        ):
+            return False
+
+        self.alpha_ = alpha_new
+
+        self.rho_ = float(
+            self.rho_ + d_rho * delta
+        )
         self.offset_ = self.rho_
         self.intercept_ = -self.rho_
 
@@ -1053,7 +815,7 @@ class ICOSVM(BaseSVM):
 
         and with
 
-            g_i = Ktilde_i alpha - rho
+            g_i = (G alpha)_i - rho
 
         we require approximately:
 
@@ -1149,12 +911,15 @@ class ICOSVM(BaseSVM):
         self,
     ) -> None:
         """
-        Re-solve the current complete COSVM QP.
+        Re-solve the current complete COSVM dual (the exact update path).
 
-        This is the numerical correction path used when the incremental
-        sensitivity update does not satisfy the complete KKT system.
+        The current alpha_ (previous solution extended by alpha_c = 0, or
+        with the removed entry deleted) is the warm start; it is made
+        feasible for the new box inside ``_solve_batch_qp``.
         """
         self._solve_batch_qp()
+
+        self.n_qp_solves_ += 1
 
         self._update_sets()
         self._compute_rho()
@@ -1169,7 +934,11 @@ class ICOSVM(BaseSVM):
         x: np.ndarray,
     ) -> "ICOSVM":
         """
-        Incrementally incorporate one new observation.
+        Incorporate one new observation.
+
+        The geometry is rebuilt for the new buffer, the KKT predictor is
+        tried and accepted only if the new problem's KKT conditions hold;
+        otherwise the dual is re-solved exactly from the warm start.
 
         Parameters
         ----------
@@ -1186,7 +955,7 @@ class ICOSVM(BaseSVM):
         ).reshape(-1)
 
         # --------------------------------------------------------------
-        # First observation.
+        # First observation (empty model): fit on the single row.
         # --------------------------------------------------------------
 
         if not self.X_buffer_:
@@ -1196,6 +965,7 @@ class ICOSVM(BaseSVM):
                     -1,
                 )
             )
+            self._enforce_max_samples()
             return self
 
         # --------------------------------------------------------------
@@ -1238,9 +1008,7 @@ class ICOSVM(BaseSVM):
         )
 
         # --------------------------------------------------------------
-        # Recompute the complete covariance-guided kernel.
-        #
-        # This is required because H changes from N to N+1.
+        # Rebuild K, G and A^{-1} (H and N changed).
         # --------------------------------------------------------------
 
         self._recompute_full_matrices()
@@ -1249,54 +1017,39 @@ class ICOSVM(BaseSVM):
         # Extend alpha with candidate alpha_c = 0.
         # --------------------------------------------------------------
 
-        self.alpha_ = np.append(
+        alpha_extended = np.append(
             self.alpha_,
             0.0,
         )
 
-        # --------------------------------------------------------------
-        # The previous alpha vector may no longer satisfy the new
-        # C because C decreases as N grows.
-        #
-        # If any old coefficient is now above C, the incremental
-        # sensitivity path is invalid.
-        # --------------------------------------------------------------
-
-        if np.max(
-            self.alpha_ - self.C_
-        ) > self.kkt_tol:
-            self._correct_with_batch_qp()
-            self._sync_support_vectors()
-            self._enforce_max_samples()
-            return self
+        self.alpha_ = alpha_extended.copy()
 
         # --------------------------------------------------------------
-        # Attempt sensitivity update.
+        # KKT predictor; only meaningful if the old coefficients are
+        # still inside the new (smaller) box.
         # --------------------------------------------------------------
 
-        success = (
-            self._incremental_candidate_update(
-                c
-            )
-        )
+        accepted = False
 
-        # --------------------------------------------------------------
-        # Always verify the complete KKT state.
-        # --------------------------------------------------------------
+        if np.max(alpha_extended) <= self.C_:
+            if (
+                self._incremental_candidate_update(c)
+                and self._check_kkt()
+            ):
+                # rho from the shared rule, then re-check.
+                self._compute_rho()
+                accepted = self._check_kkt()
 
-        if not success or not self._check_kkt():
-            self._correct_with_batch_qp()
-
-        else:
-            self._compute_rho()
+        if accepted:
+            self.n_incremental_updates_ += 1
+            self.coef_ = self.geometry_.coef(self.alpha_)
+            self._update_sets()
             self._build_R_matrix()
 
-            # The rho recomputation is deliberately performed after
-            # the sensitivity update to eliminate accumulated
-            # numerical drift.
-
-            if not self._check_kkt():
-                self._correct_with_batch_qp()
+        else:
+            # Warm start: previous solution extended by alpha_c = 0.
+            self.alpha_ = alpha_extended
+            self._correct_with_batch_qp()
 
         self._sync_support_vectors()
 
@@ -1319,7 +1072,7 @@ class ICOSVM(BaseSVM):
         """
         Sequentially learn a batch of observations.
         """
-        X_arr = check_array(X)
+        X_arr = check_array(X, n_features=getattr(self, "n_features_in_", None))
 
         for i in range(
             X_arr.shape[0]
@@ -1340,6 +1093,11 @@ class ICOSVM(BaseSVM):
     ) -> "ICOSVM":
         """
         Remove one sample from the current buffer.
+
+        The remaining problem (new N, C, H and G) is re-solved exactly
+        from the remaining coefficients as a warm start.
+        ``n_samples_seen_`` is not changed (it counts observed samples);
+        ``n_unlearned_`` is incremented.
 
         Parameters
         ----------
@@ -1374,13 +1132,14 @@ class ICOSVM(BaseSVM):
 
         del self.X_buffer_[index]
 
-        self.n_samples_seen_ = max(
-            0,
-            self.n_samples_seen_ - 1,
-        )
+        self.n_unlearned_ += 1
 
         if not self.X_buffer_:
             self.alpha_ = np.empty(
+                0,
+                dtype=float,
+            )
+            self.coef_ = np.empty(
                 0,
                 dtype=float,
             )
@@ -1391,6 +1150,7 @@ class ICOSVM(BaseSVM):
 
             self.K_full_ = None
             self.K_tilde_full_ = None
+            self.geometry_ = None
 
             self.R_ = None
 
@@ -1406,10 +1166,12 @@ class ICOSVM(BaseSVM):
         # Recompute complete matrices.
         # --------------------------------------------------------------
 
-        self.alpha_ = np.delete(
+        remaining_alpha = np.delete(
             self.alpha_,
             index,
         )
+
+        self.alpha_ = remaining_alpha
 
         self._recompute_full_matrices()
 
@@ -1422,10 +1184,10 @@ class ICOSVM(BaseSVM):
         )
 
         # --------------------------------------------------------------
-        # Decremental covariance changes globally, so solve/correct
-        # the complete QP.
+        # G changes globally, so re-solve the complete dual.
         # --------------------------------------------------------------
 
+        # Warm start: the remaining coefficients (self.alpha_).
         self._correct_with_batch_qp()
 
         self._sync_support_vectors()
@@ -1507,30 +1269,26 @@ class ICOSVM(BaseSVM):
         )
 
     # ==================================================================
-    # Test-time modified kernel
+    # Test-time kernels
     # ==================================================================
 
-    def _transform_test_kernel(
+    def _test_kernel(
         self,
         X: np.ndarray,
     ) -> np.ndarray:
         """
-        Compute
-
-            Ktilde_test
-                = eta K_test
-                + (1 - eta) K_test H K^T.
+        Raw kernel k(X, X_buffer).
         """
         check_is_fitted(self)
 
-        X_arr = check_array(X)
+        X_arr = check_array(X, n_features=getattr(self, "n_features_in_", None))
 
         X_train = np.asarray(
             self.X_buffer_,
             dtype=float,
         )
 
-        K_test = np.asarray(
+        return np.asarray(
             self.kernel_(
                 X_arr,
                 X_train,
@@ -1538,36 +1296,25 @@ class ICOSVM(BaseSVM):
             dtype=float,
         )
 
-        n_samples = (
-            X_train.shape[0]
-        )
+    def _transform_test_kernel(
+        self,
+        X: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Dual cross-Gram between test and buffered samples,
 
-        if (
-            self.eta == 1.0
-            or n_samples <= 1
-        ):
+            G(X, X_buffer) = k(X, X_buffer) A^{-1} K,
+
+        whose rows on buffered points are rows of G.
+        """
+        K_test = self._test_kernel(X)
+
+        if self.geometry_.cho_ is None:
             return K_test
 
-        # K_test H
-        K_test_centered = (
-            K_test
-            - np.mean(
-                K_test,
-                axis=1,
-                keepdims=True,
-            )
-        )
-
-        # K_test H K_train^T
-        covariance_component = (
-            K_test_centered
-            @ self.K_full_.T
-        )
-
-        return (
-            self.eta * K_test
-            + (1.0 - self.eta)
-            * covariance_component
+        return K_test @ cho_solve(
+            self.geometry_.cho_,
+            self.K_full_,
         )
 
     # ==================================================================
@@ -1581,18 +1328,11 @@ class ICOSVM(BaseSVM):
         """
         Compute raw COSVM/ICOSVM scores:
 
-            score(x)
-                = sum_i alpha_i Ktilde(x, x_i).
+            score(x) = k(x, X)^T coef_ = k(x, X)^T A^{-1} K alpha.
         """
-        check_is_fitted(self)
-
-        K_tilde_test = (
-            self._transform_test_kernel(X)
-        )
-
         return (
-            K_tilde_test
-            @ self.alpha_
+            self._test_kernel(X)
+            @ self.coef_
         )
 
     def decision_function(
@@ -1643,8 +1383,6 @@ class ICOSVM(BaseSVM):
         """
         Return numerical KKT diagnostics.
 
-        Useful for validating the incremental algorithm.
-
         Returns
         -------
         dict
@@ -1656,6 +1394,9 @@ class ICOSVM(BaseSVM):
                 max_zero_violation
                 max_free_violation
                 max_C_violation
+                is_kkt
+                n_incremental_updates
+                n_qp_solves
         """
         check_is_fitted(self)
 
@@ -1735,6 +1476,12 @@ class ICOSVM(BaseSVM):
             "max_free_violation": free_violation,
             "max_C_violation": C_violation,
             "is_kkt": self._check_kkt(),
+            "n_incremental_updates": int(
+                self.n_incremental_updates_
+            ),
+            "n_qp_solves": int(
+                self.n_qp_solves_
+            ),
         }
 
     @property
