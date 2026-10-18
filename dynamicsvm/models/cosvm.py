@@ -38,16 +38,28 @@ Its dual is
     minimize    1/2 alpha^T G alpha
     subject to  0 <= alpha_i <= C,   sum(alpha_i) = 1,
 
-    G = K A^{-1} K,   A = eta K + ((1 - eta)/N) K H K,
+    G = K B^{-1},   B = eta I + ((1 - eta)/N) H K,
 
-and the decision function is
+which is the unconditionally valid form: B is invertible for every
+eta > 0 because spec(H K) lies in [0, inf), so spec(B) lies in
+[eta, inf). The symmetric form
 
-    f(x) = k(x, X)^T A^{-1} K alpha - rho = k(x, X)^T coef - rho.
+    G = K A^{-1} K,   A = K B = eta K + ((1 - eta)/N) K H K,
+
+is the same matrix ONLY when K is invertible, which routinely fails (a
+linear kernel with N > d, duplicated rows, any rank-deficient Gram). The
+object actually computed is the ridged K (A + eps I)^{-1} K with
+eps = reg * trace(A) / N, factored by Cholesky; A is symmetric PSD, which
+is why it, and not B, is the matrix that gets factorised.
+
+The decision function is
+
+    f(x) = k(x, X)^T coef - rho,   coef = (A + eps I)^{-1} K alpha.
 
 On training rows K coef = G alpha, so the KKT conditions and the decision
 function use the same scores. eta = 1 is exactly the standard one-class
-SVM (G = K). The derivation and the numerical treatment (Cholesky of
-A + eps I) are in ``dynamicsvm.models._cosvm_core``.
+SVM (G = K). The full derivation and the numerical treatment are in
+``dynamicsvm.models._cosvm_core``.
 
 Positive values correspond to normal samples and negative values
 correspond to anomalies.
@@ -157,7 +169,8 @@ class COSVM(BaseSVM):
         Original kernel Gram matrix.
 
     K_tilde_ : ndarray
-        Dual Gram matrix G = K A^{-1} K.
+        Dual Gram matrix G = K B^{-1} (equal to K A^{-1} K only for
+        invertible K; see ``dynamicsvm.models._cosvm_core``).
 
     geometry_ : COSVMGeometry
         Factorised geometry of the training set.
@@ -283,14 +296,17 @@ class COSVM(BaseSVM):
         """
         Compute the COSVM dual Gram matrix
 
-            G = K A^{-1} K,   A = eta K + ((1 - eta)/N) K H K,
+            G = K B^{-1},   B = eta I + ((1 - eta)/N) H K,
 
-        (G = K when eta == 1). See ``_cosvm_core.COSVMGeometry``.
+        equal to K A^{-1} K with A = K B only when K is invertible, and
+        computed as K (A + eps I)^{-1} K (G = K when eta == 1). See
+        ``_cosvm_core.COSVMGeometry``.
         """
         return COSVMGeometry(
             K,
             self.eta,
             reg=self.reg,
+            psd_tol=self.psd_tol,
         ).G
 
     def _stabilize_psd_matrix(
@@ -383,13 +399,14 @@ class COSVM(BaseSVM):
         )
 
         # --------------------------------------------------------------
-        # COSVM dual Gram G = K A^{-1} K
+        # COSVM dual Gram G = K B^{-1} (= K A^{-1} K for invertible K)
         # --------------------------------------------------------------
 
         self.geometry_ = COSVMGeometry(
             self.K_train_,
             self.eta,
             reg=self.reg,
+            psd_tol=self.psd_tol,
         )
 
         self.K_tilde_ = self._stabilize_psd_matrix(

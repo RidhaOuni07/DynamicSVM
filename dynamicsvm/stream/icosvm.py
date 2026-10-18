@@ -21,7 +21,11 @@ ICOSVM shares the formulation of :class:`dynamicsvm.models.cosvm.COSVM`
 (derivation in ``dynamicsvm.models._cosvm_core``). For the N buffered
 samples, H = I - (1/N) 11^T and
 
-    G = K A^{-1} K,   A = eta K + ((1 - eta)/N) K H K,   0 < eta <= 1.
+    G = K B^{-1},   B = eta I + ((1 - eta)/N) H K,   0 < eta <= 1,
+
+equal to the symmetric K A^{-1} K with A = K B only when K is invertible
+and computed as K (A + eps I)^{-1} K (derivation and preconditions in
+``dynamicsvm.models._cosvm_core``).
 
 The dual optimization problem is:
 
@@ -73,12 +77,23 @@ Cauwenberghs-Poggio path does not apply. The update therefore
 3. otherwise re-solves the dual exactly (SLSQP from the feasible warm
    start, refined to the KKT conditions).
 
-Because G changes globally with N, the predictor is rarely accepted for
-eta < 1 (for eta = 1, G = K does not change for the old samples and it is
-accepted more often); ``n_incremental_updates_`` and ``n_qp_solves_``
-report how often each path ran. After a re-solve the model equals batch
-COSVM on the same buffer and kernel to solver precision; after an accepted
-predictor it satisfies the KKT conditions of that problem to ``kkt_tol``.
+Because G changes globally with N, the one-parameter
+Cauwenberghs-Poggio path does not transfer and the predictor is rarely
+accepted. eta = 1 does NOT help, contrary to what this docstring used to
+claim: with G = K unchanged for the old samples, acceptance was still
+measured at 0/40 for nu >= 0.2, and at 0/40 for every eta in
+{1.0, 0.9, 0.5, 0.4, 0.1} at nu = 0.2. The binding mechanism is the guard
+``if np.max(alpha_extended) <= self.C_`` (see ``_sensitivity_step``'s
+call site), which skips the predictor before it is even attempted
+whenever |E| >= 1: C = 1/(nu N) SHRINKS as N grows, so any coefficient
+sitting at the old C already exceeds the new one. The predictor is
+therefore reached only when no coefficient is at C, which was 28/40 of
+the updates at nu <= 0.05. ``n_incremental_updates_`` and
+``n_qp_solves_`` report the realised split.
+
+After a re-solve the model equals batch COSVM on the same buffer and
+kernel to solver precision; after an accepted predictor it satisfies the
+KKT conditions of that problem to ``kkt_tol``.
 The cost of an update is that of a batch fit (O(N^3)), not O(N_s^2).
 """
 
@@ -239,7 +254,8 @@ class ICOSVM(BaseSVM):
         Current kernel Gram matrix.
 
     K_tilde_full_ : ndarray
-        Current dual Gram matrix G = K A^{-1} K.
+        Current dual Gram matrix G = K B^{-1} (equal to K A^{-1} K only
+        for invertible K; see ``dynamicsvm.models._cosvm_core``).
 
     geometry_ : COSVMGeometry
         Factorised geometry of the current buffer.
@@ -395,9 +411,11 @@ class ICOSVM(BaseSVM):
         """
         Compute the COSVM dual Gram matrix
 
-            G = K A^{-1} K,   A = eta K + ((1 - eta)/N) K H K
+            G = K B^{-1},   B = eta I + ((1 - eta)/N) H K
 
-        (shared with COSVM / IDCOSVM, see ``_cosvm_core``).
+        computed as K (A + eps I)^{-1} K with A = K B, which equals
+        K A^{-1} K only for invertible K (shared with COSVM / IDCOSVM,
+        see ``_cosvm_core``).
         """
         return COSVMGeometry(K, self.eta).G
 

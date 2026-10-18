@@ -33,12 +33,42 @@ hence w = M^{-1} Phi alpha and the dual is
     G = Phi^T M^{-1} Phi.
 
 Kernelisation. M maps span(Phi) into itself, so M^{-1} Phi = Phi Z with
-(eta I + ((1 - eta)/N) H K) Z = I. Therefore
+B Z = I, where
 
-    G = K Z = K (eta I + ((1 - eta)/N) H K)^{-1} = K A^{-1} K,
-    A = eta K + ((1 - eta)/N) K H K          (symmetric PSD),
+    B = eta I + ((1 - eta)/N) H K.
 
-and the out-of-sample score is
+The primary form of the dual Gram matrix is therefore
+
+    G = K Z = K B^{-1},
+
+which is valid unconditionally, because B is invertible for every
+eta > 0: H K is similar to the PSD matrix K^{1/2} H K^{1/2} on range(K)
+(and acts as zero on the complement), so spec(H K) lies in [0, inf) and
+spec(B) in [eta, inf). No assumption on K is needed.
+
+The familiar symmetric form
+
+    G = K A^{-1} K,   A = K B = eta K + ((1 - eta)/N) K H K,
+
+is equivalent to K B^{-1} ONLY when K is invertible, since A^{-1} =
+B^{-1} K^{-1} requires K^{-1}. That precondition routinely fails here --
+a linear kernel with N > d, duplicated rows, or any rank-deficient Gram
+matrix -- and then K A^{-1} K is undefined while K B^{-1} is not. Treat
+K A^{-1} K as shorthand for K B^{-1}, not as the definition.
+
+What this module actually COMPUTES is the ridged symmetric form
+
+    G = K (A + eps I)^{-1} K,   eps = reg * trace(A) / N,
+
+and the symmetric A is still the right object to compute: A is symmetric
+PSD, so A + eps I admits a Cholesky factorisation (one O(N^3) factor,
+reused for coef), G comes out symmetric by construction, and the ridge is
+relative to the scale of A. The non-symmetric K B^{-1} would need an
+explicit symmetrisation and a general LU solve. As eps -> 0 the computed
+G converges to K B^{-1} on range(K), with an error that is first order in
+eps (see Numerics).
+
+With that in hand, the out-of-sample score is
 
     w^T phi(x) = phi(x)^T Phi Z alpha = k(x)^T A^{-1} K alpha = k(x)^T coef,
     coef = A^{-1} K alpha,
@@ -54,8 +84,14 @@ is regularised as A + eps I with eps = reg * trace(A) / N and factored once
 by Cholesky. For a linear kernel K (A + eps I)^{-1} K -> X M^{-1} X^T as
 eps -> 0. eta = 1 short-circuits to G = K, coef = alpha (exactly the
 standard one-class SVM). eta = 0 is rejected: A is then singular along
-K^{-1} 1, which leaves the training dual unchanged but makes out-of-sample
-scores scale like 1/eps.
+K^{-1} 1, which makes out-of-sample scores scale like 1/eps.
+
+The training dual is not eta-invariant as eta -> 0 either: alpha only
+SATURATES below about eta = 1e-4 (measured max|delta alpha| = 0.167
+between eta = 0.5 and eta = 1e-4), so a small eta solves a materially
+different problem rather than the same one. The ridge error in G is
+likewise first order in reg and grows like 1/eta, because the smallest
+eigenvalue of A scales with eta.
 """
 
 import warnings
@@ -81,7 +117,12 @@ def validate_eta(eta: float) -> float:
 
 class COSVMGeometry:
     """
-    Dual Gram matrix G = K A^{-1} K and score coefficients of a COSVM.
+    Dual Gram matrix G = K B^{-1} and score coefficients of a COSVM.
+
+    B = eta I + ((1 - eta)/N) H K is always invertible for eta > 0; the
+    symmetric form K A^{-1} K with A = K B is the same matrix only when K
+    is invertible, and what is computed is the ridged K (A + eps I)^{-1} K
+    (see the module docstring for the derivation).
 
     Parameters
     ----------
@@ -94,16 +135,35 @@ class COSVMGeometry:
     reg : float, default=1e-10
         Relative ridge: A + eps I with eps = reg * trace(A) / N.
 
+    psd_tol : float, default=1e-10
+        Relative tolerance of the positive-semidefiniteness certificate,
+        >= 0. At eta == 1 the dual Gram matrix is K itself, so K must be
+        PSD: a Cholesky factorisation of K + psd_tol * max(1, max_k |K_kk|) I
+        is attempted and, if it fails, ``stabilize_psd`` decides between
+        rounding-level negative curvature (shifted to zero) and a genuinely
+        indefinite kernel (ValueError). For eta < 1 the Cholesky of
+        A + eps I already certifies G >= 0 and psd_tol is unused.
+
     Attributes
     ----------
     K : ndarray
         Symmetrised kernel matrix.
 
     G : ndarray
-        Dual Gram matrix (symmetric PSD).
+        Dual Gram matrix (symmetric PSD). At eta == 1 with a PSD kernel it
+        is a bit-identical copy of K, which preserves the exact reduction
+        to the standard one-class SVM.
 
     eps_ : float
         Ridge actually added to A (0.0 when eta == 1).
+
+    n_ridge_growths_ : int
+        Number of times eps had to be multiplied by 10 before the
+        Cholesky factorisation of A + eps I existed. 0 when the first
+        factorisation succeeded, and 0 on the eta == 1 path (no ridge).
+        A non-zero value means rounding in A exceeded the requested
+        relative ridge, so eps_ is 10 ** n_ridge_growths_ times
+        reg * trace(A) / N.
     """
 
     def __init__(
@@ -111,6 +171,7 @@ class COSVMGeometry:
         K: np.ndarray,
         eta: float,
         reg: float = 1e-10,
+        psd_tol: float = 1e-10,
     ):
         K = np.asarray(K, dtype=float)
 
@@ -124,16 +185,51 @@ class COSVMGeometry:
                 f"reg must be > 0, got {reg}"
             )
 
+        if psd_tol < 0:
+            raise ValueError(
+                f"psd_tol must be >= 0, got {psd_tol}"
+            )
+
         self.K = 0.5 * (K + K.T)
         self.eta = validate_eta(eta)
         self.reg = float(reg)
+        self.psd_tol = float(psd_tol)
         self.n_samples = self.K.shape[0]
 
         self.cho_ = None
         self.eps_ = 0.0
+        self.n_ridge_growths_ = 0
 
         if self.eta == 1.0:
-            self.G = self.K.copy()
+            # G = K, so the dual is convex only if K is PSD. A jittered
+            # Cholesky is a sufficient certificate and is cheaper than an
+            # eigendecomposition; it succeeded on every PSD kernel tried
+            # (rank-deficient linear, duplicated rows, d >> N) and failed
+            # on an indefinite sigmoid kernel.
+            if self.n_samples == 0:
+                self.G = self.K.copy()
+                return
+
+            jitter = self.psd_tol * max(
+                1.0,
+                float(np.max(np.abs(np.diag(self.K)))),
+            )
+
+            try:
+                cho_factor(
+                    self.K + jitter * np.eye(self.n_samples),
+                    lower=True,
+                )
+            except LinAlgError:
+                # Either rounding-level negative curvature (shifted to
+                # zero) or a genuinely indefinite kernel (ValueError).
+                self.G = stabilize_psd(self.K, self.psd_tol)
+            else:
+                # Certificate passed: keep G bit-identical to K, which is
+                # what makes eta = 1 reduce exactly to the one-class SVM
+                # and keeps K @ coef == G @ alpha.
+                self.G = self.K.copy()
+
             return
 
         N = self.n_samples
@@ -159,7 +255,7 @@ class COSVMGeometry:
         # Rounding in A can exceed a very small ridge for large N; grow
         # the ridge until the Cholesky factorisation exists.
         identity = np.eye(N)
-        for _ in range(8):
+        for growths in range(8):
             try:
                 self.cho_ = cho_factor(
                     A + eps * identity,
@@ -174,6 +270,7 @@ class COSVMGeometry:
             )
 
         self.eps_ = float(eps)
+        self.n_ridge_growths_ = int(growths)
 
         G = self.K @ cho_solve(self.cho_, self.K)
         self.G = 0.5 * (G + G.T)
@@ -467,7 +564,19 @@ def solve_oneclass_dual(
         Feasible dual solution (snapped to the bounds within 1e-12 C).
 
     result : scipy.optimize.OptimizeResult or None
-        Raw SLSQP result (None when N == 1).
+        Raw SLSQP result (None when N == 1), carrying three extra keys
+        that certify the returned point:
+
+        ``kkt_gap``
+            max_i violation of the one-class KKT conditions of the
+            RETURNED alpha, in the units of G.
+        ``objective_scale``
+            scale = max(max_k G_kk, tiny), the natural scale of the
+            scores because |(G a)_i| <= max_k G_kk for every feasible a,
+            and the constant the solve is normalised by (see Notes).
+        ``kkt_gap_relative``
+            ``kkt_gap / objective_scale``, dimensionless; this is the
+            quantity the final gate tests, and it accepts below 1e-6.
 
     Raises
     ------
@@ -481,6 +590,17 @@ def solve_oneclass_dual(
     The SLSQP point is refined by maximal-violating-pair steps and an
     exact solve of the KKT system on the identified partition, so the
     returned alpha does not depend on the warm start beyond rounding.
+
+    The problem is solved on the normalised Gram matrix
+    G_n = G / max(max_k G_kk, tiny). Scaling a quadratic by a positive
+    constant does not move its argmin, so the returned alpha is unchanged
+    in meaning and no caller has to rescale anything (``compute_rho`` is
+    deliberately called on the UNNORMALISED G, and must stay that way).
+    The reason to normalise is that ftol is absolute on the objective
+    while |G| grows like 1/eta: at eta = 1e-8, max_k G_kk is already
+    ~8e+06, so an unnormalised objective of size O(1/eta) makes
+    ftol = 1e-10 unreachable and SLSQP stops at a point that fails the
+    absolute feasibility gate. On G_n the objective is O(1) at every eta.
     """
     G = np.asarray(G, dtype=float)
     n_samples = G.shape[0]
@@ -498,11 +618,22 @@ def solve_oneclass_dual(
 
     start = feasible_start(x0, n_samples, C)
 
+    # |(G a)_i| <= max_k G_kk for every feasible a (G PSD, sum a = 1), so
+    # the diagonal is the natural scale of the scores and of the gap. The
+    # whole solve runs on G / scale: the argmin is identical, but the
+    # objective is O(1) at every eta, which is what makes the absolute
+    # ftol and the absolute feasibility gate meaningful (|G| ~ 1/eta).
+    scale = max(
+        float(np.max(np.diag(G))),
+        np.finfo(float).tiny,
+    )
+    G_n = G / scale
+
     def objective(alpha: np.ndarray) -> float:
-        return 0.5 * float(alpha @ G @ alpha)
+        return 0.5 * float(alpha @ G_n @ alpha)
 
     def gradient(alpha: np.ndarray) -> np.ndarray:
-        return G @ alpha
+        return G_n @ alpha
 
     constraints = [
         {
@@ -567,28 +698,23 @@ def solve_oneclass_dual(
     # of the identified partition is solved exactly.
     # ------------------------------------------------------------------
 
-    # |(G a)_i| <= max_k G_kk for every feasible a (G PSD, sum a = 1), so
-    # the diagonal is the natural scale of the scores and of the gap.
-    scale = max(
-        float(np.max(np.diag(G))),
-        np.finfo(float).tiny,
-    )
-
+    # On G_n the scale is exactly 1, so the gap and its target are
+    # dimensionless; they are reported below in the units of G.
     alpha = _refine_pairwise(
-        G,
+        G_n,
         alpha,
         C,
-        target_gap=1e-12 * scale,
+        target_gap=1e-12,
         max_steps=50 * n_samples,
     )
-    alpha = _polish_active_set(G, alpha, C)
+    alpha = _polish_active_set(G_n, alpha, C)
 
-    gap = _kkt_gap(alpha, G, C)
+    gap_n = _kkt_gap(alpha, G_n, C)
 
-    if gap > 1e-6 * scale:
+    if gap_n > 1e-6:
         message = (
             "COSVM dual optimisation: relative KKT gap "
-            f"{gap / scale:.3e} after refinement (SLSQP: {result.message})"
+            f"{gap_n:.3e} after refinement (SLSQP: {result.message})"
         )
 
         if not result.success:
@@ -599,6 +725,12 @@ def solve_oneclass_dual(
             RuntimeWarning,
             stacklevel=2,
         )
+
+    # OptimizeResult is a dict subclass, so attaching the certificate is
+    # purely additive: callers unpacking the 2-tuple are unaffected.
+    result["kkt_gap"] = float(gap_n * scale)
+    result["objective_scale"] = float(scale)
+    result["kkt_gap_relative"] = float(gap_n)
 
     return alpha, result
 
