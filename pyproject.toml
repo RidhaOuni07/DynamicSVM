@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dynamicsvm"
 version = "0.1.0"
-description = "A modular Python library for Static and Dynamic (Incremental, Decremental, Concept Drift) Support Vector Machines"
+description = "Covariance-guided one-class SVMs with streaming, decremental, and drift-aware variants"
 readme = "README.md"
 requires-python = ">=3.8"
 authors = [
@@ -19,6 +19,5 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=7.0.0",
-    "scikit-learn>=1.3"
+    "pytest>=7.0.0"
 ]

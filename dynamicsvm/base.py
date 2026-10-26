@@ -28,28 +28,7 @@ class BaseEstimator(ABC):
         return self
 
 
-class BaseClassifier(BaseEstimator):
-    """Base class for classifiers in DynamicSVM."""
-
-    @abstractmethod
-    def fit(self, X: np.ndarray, y: np.ndarray) -> "BaseClassifier":
-        """Fit the model according to the given training data."""
-        pass
-
-    @abstractmethod
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        """Predict class labels for samples in X."""
-        pass
-
-    def score(self, X: np.ndarray, y: np.ndarray) -> float:
-        """
-        Return the mean accuracy on the given test data and labels.
-        """
-        y_pred = self.predict(X)
-        return float(np.mean(y_pred == y))
-
-
-class BaseSVM(BaseClassifier):
+class BaseSVM(BaseEstimator):
     """
     Base class for Support Vector Machine models.
     Provides common properties for support vectors, dual coefficients, and intercept.
@@ -60,7 +39,6 @@ class BaseSVM(BaseClassifier):
         self.dual_coef_: Optional[np.ndarray] = None
         self.support_: Optional[np.ndarray] = None
         self.intercept_: float = 0.0
-        self.classes_: Optional[np.ndarray] = None
         self.n_support_: Optional[np.ndarray] = None
 
     @property
@@ -73,4 +51,14 @@ class BaseSVM(BaseClassifier):
         """
         Evaluate the decision function for the samples in X.
         """
+        pass
+
+    @abstractmethod
+    def fit(self, X: np.ndarray) -> "BaseSVM":
+        """Fit the one-class model to normal training samples."""
+        pass
+
+    @abstractmethod
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Return inlier and outlier labels for samples in X."""
         pass

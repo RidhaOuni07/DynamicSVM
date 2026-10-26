@@ -1,13 +1,7 @@
-"""
-Concept drift detection and adaptation wrappers for SVM.
-"""
+"""Binary drift detectors used by one-class streaming models."""
 
 from abc import ABC, abstractmethod
-from typing import Optional, Union
 import numpy as np
-
-from dynamicsvm.base import BaseClassifier
-from dynamicsvm.stream.windowed import SlidingWindowSVM
 
 
 class DriftDetector(ABC):
@@ -120,62 +114,3 @@ class DDMDriftDetector(DriftDetector):
             self.in_warning_zone = False
             self.in_drift_zone = False
             return False
-
-
-class DriftAwareSVM(BaseClassifier):
-    """
-    Concept Drift Aware SVM wrapper.
-    Monitors streaming prediction accuracy and triggers adaptive model rejuvenation
-    when concept drift occurs.
-    """
-
-    def __init__(
-        self,
-        base_estimator: Optional[SlidingWindowSVM] = None,
-        drift_detector: Optional[DriftDetector] = None,
-    ):
-        self.base_estimator = base_estimator or SlidingWindowSVM()
-        self.drift_detector = drift_detector or DDMDriftDetector()
-        self.n_drifts_detected_ = 0
-
-    def fit(self, X: np.ndarray, y: np.ndarray) -> "DriftAwareSVM":
-        self.base_estimator.fit(X, y)
-        self.drift_detector.reset()
-        self.n_drifts_detected_ = 0
-        return self
-
-    def learn_one(self, x: np.ndarray, y: Union[int, float, str]) -> bool:
-        """
-        Process a new instance (x, y):
-        1. Predict on x and evaluate error.
-        2. Feed error to drift detector.
-        3. If drift detected, reset detector and adapt base estimator.
-        4. Update base estimator with (x, y).
-        
-        Returns True if a drift was detected.
-        """
-        pred = self.base_estimator.predict(x.reshape(1, -1))[0]
-        error = (pred != y)
-
-        drift_detected = self.drift_detector.update(error)
-        if drift_detected:
-            self.n_drifts_detected_ += 1
-            self.drift_detector.reset()
-            # On drift, retain the most recent fraction of the buffer
-            if len(self.base_estimator._buffer_X) > 4:
-                keep_k = max(2, len(self.base_estimator._buffer_X) // 2)
-                recent_X = list(self.base_estimator._buffer_X)[-keep_k:]
-                recent_y = list(self.base_estimator._buffer_y)[-keep_k:]
-                self.base_estimator._buffer_X.clear()
-                self.base_estimator._buffer_y.clear()
-                self.base_estimator._buffer_X.extend(recent_X)
-                self.base_estimator._buffer_y.extend(recent_y)
-
-        self.base_estimator.learn_one(x, y)
-        return drift_detected
-
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        return self.base_estimator.predict(X)
-
-    def decision_function(self, X: np.ndarray) -> np.ndarray:
-        return self.base_estimator.decision_function(X)
